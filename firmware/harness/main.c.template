@@ -1,0 +1,35 @@
+/* Auto-generated firmware harness for arrax compiler output.
+ *
+ * This template is filled in by arrax.codegen.firmware_harness
+ * based on the compiled kernel's signature.
+ */
+
+#include <stdint.h>
+
+/* UART output (memory-mapped, matches riscv-npu emulator) */
+volatile char *uart = (volatile char *)0x10000000;
+
+void print_char(char c) { *uart = c; }
+
+void print_str(const char *s) {
+    while (*s) print_char(*s++);
+}
+
+/* Kernel function (from compiled .S file) */
+extern void npu_kernel(${KERNEL_PARAMS});
+
+/* Array buffers */
+${BUFFER_DECLARATIONS}
+
+int main(void) {
+    /* Initialize inputs */
+    ${INPUT_INIT}
+
+    /* Run kernel */
+    npu_kernel(${KERNEL_ARGS});
+
+    /* Print output for verification */
+    ${OUTPUT_PRINT}
+
+    return 0;
+}

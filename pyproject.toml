@@ -1,0 +1,28 @@
+[project]
+name = "arrax"
+version = "0.1.0"
+description = "MLIR-based compiler that fuses array expressions in Python and emits optimized RISC-V assembly targeting riscv-npu"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = [
+    "xdsl>=0.58.0",
+    "numpy>=1.26.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-xdist>=3.5",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/arrax"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v"
