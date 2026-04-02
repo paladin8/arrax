@@ -1,12 +1,12 @@
-"""Tests for custom dialect definitions (array, npu)."""
+"""Tests for arrax.dialects.array_dialect — array dialect definition."""
 
 from __future__ import annotations
+
+import pytest
 
 from xdsl.dialects.builtin import Float32Type, ModuleOp, TensorType
 from xdsl.utils.exceptions import VerifyException
 from xdsl.utils.test_value import create_ssa_value
-
-import pytest
 
 from arrax.dialects.array_dialect import AddOp, ArrayDialect
 

@@ -178,11 +178,14 @@ The intermediate `%tmp` is eliminated entirely. This is the primary advantage ov
 
 ### 1.6 Bufferization
 
-Converts `tensor` types to `memref` types using xDSL's bufferization infrastructure.
+Converts `tensor` types to `memref` types using a custom bufferization pass (xDSL has no general-purpose one-shot bufferization).
 
-- Output buffers alias inputs (in-place) where safe
-- Stack allocation for tile-sized intermediates
+- Output buffers become function arguments (destination-passing style)
+- Intermediate buffers use `memref.alloc`
+- Stack allocation for tile-sized intermediates (when tiling is enabled)
 - Static allocation for input/output arrays in the firmware memory map
+
+**Buffer reuse and deallocation**: The initial implementation allocates a fresh buffer for each intermediate and never deallocates. A future optimization pass can perform liveness analysis to reuse buffers (e.g., in `A + B + C + D`, the first intermediate is dead before the second is needed) and insert `memref.dealloc` where appropriate. This is not needed for Milestone 1 since the NPU firmware runs once on a flat memory region.
 
 After bufferization, `linalg.generic` operates on memrefs in destination-passing style:
 ```
@@ -599,7 +602,8 @@ arrax/
 2. Elementwise fusion pass
 3. Fused expression tests: `(A + B) * C`, `(A + B) * 0.5 + C`
 4. Unary ops (relu, gelu, exp) with NPU lowering
-5. Verify fused chains produce minimal instruction counts
+5. Buffer reuse pass: liveness analysis to share intermediate memref.alloc buffers
+6. Verify fused chains produce minimal instruction counts
 
 ### Milestone 3: Reductions and dot product (Week 2-3)
 
