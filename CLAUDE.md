@@ -4,8 +4,6 @@ MLIR-based compiler that fuses array expressions in Python and emits optimized R
 
 ## Commands
 - uv run pytest                          — run all tests
-- uv run pytest tests/test_dsl.py -v     — DSL tests only
-- uv run pytest tests/test_lowering.py -v — lowering pass tests only
 - uv run pytest -x                       — stop on first failure
 - uv run pytest -k "test_name"           — run specific test
 - uv sync                                — install/update dependencies
@@ -28,8 +26,8 @@ MLIR-based compiler that fuses array expressions in Python and emits optimized R
 - src/arrax/lowering/        — compiler passes (array->linalg, tiling, fusion, bufferize, linalg->npu, npu->asm)
 - src/arrax/codegen/         — assembly emission, firmware harness, toolchain invocation
 - src/arrax/pipeline.py      — full pass pipeline orchestration
-- firmware/harness/           — C template, linker script, Makefile for riscv-npu firmware
-- examples/                   — usage examples
+- firmware/harness/          — C template, linker script, Makefile for riscv-npu firmware
+- examples/                  — usage examples
 
 ## Compiler pipeline
 ```
@@ -62,6 +60,7 @@ Python DSL (tracing) -> array dialect -> linalg dialect -> tiling -> fusion
 - End-to-end tests: Python expression -> assembly -> emulator -> compare with NumPy
 
 ## Git rules
+- Never commit or push unless the user explicitly tells you to
 - main is always passing
 - No branches, commit directly to main
 - Atomic commits after each working milestone
