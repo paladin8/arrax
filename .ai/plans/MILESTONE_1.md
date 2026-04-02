@@ -42,7 +42,7 @@ tests/
     └── test_bufferize.py               (9 tests)
 ```
 
-## Completed Tasks
+## Tasks
 
 ### Task 1: Array dialect — `array.add` (DONE)
 
@@ -108,31 +108,13 @@ Custom pass (xDSL 0.59.0 has no general-purpose bufferization). Rebuilds FuncOp 
 - `verify_()` checks all memrefs match and have f32 element type
 - Declarative `assembly_format` with IR round-trip support
 
-## Remaining Tasks
-
-### Task 7: Lowering — `linalg.generic [addf]` on memrefs to `npu.fvadd`
-
-Pattern-match the bufferized `linalg.generic` and replace it with `npu.fvadd`.
+### Task 7: Lowering — `linalg.generic [addf]` on memrefs to `npu.fvadd` (DONE)
 
 **File**: `src/arrax/lowering/linalg_to_npu.py`
 
-**Pattern matching criteria**:
-1. `linalg.GenericOp` with exactly 2 `ins` operands, 1 `outs` operand
-2. All three indexing maps are 1D identity: `affine_map<(d0) -> (d0)>`
-3. Single iterator type: `parallel`
-4. Body block has exactly: `arith.addf` + `linalg.yield`
-5. All operands are `memref<Nxf32>`
-
-**Emit**: `npu.fvadd src1, src2, dst, n` where:
-- `src1` = first `ins` operand
-- `src2` = second `ins` operand
-- `dst` = `outs` operand
-- `n` = `arith.constant` with the static dimension from memref shape
-
-**Tests** (`tests/lowering/test_linalg_to_npu.py`):
-- Full pipeline from `array.add` through linalg, bufferize, to `npu.fvadd`
-- Verify the final IR contains exactly one `npu.fvadd` and no `linalg.generic`
-- Golden-string IR snapshot
+- `LinalgAddToNpuPattern` matches 5 criteria: 2 ins + 1 outs, 1D identity maps, parallel iterator, addf body, memref operands
+- Emits `arith.constant N : index` + `npu.fvadd src1, src2, dst, n`
+- Non-matching ops pass through unchanged (tested with mulf negative case)
 
 ### Task 8: Assembly emission — `npu.fvadd` to `.insn` directive
 
@@ -145,99 +127,88 @@ def emit_assembly(module: ModuleOp) -> str:
     """Walk a module containing npu ops and emit RISC-V assembly."""
 ```
 
-The emitter walks the `func.func` operation and emits:
+The emitter walks the `func.func` and emits a complete `.S` file. For each op:
+- `arith.constant` → note the value (used by npu ops for element count)
+- `npu.fvadd` → copy loop (LW/SW from src2 to dst) + `.insn r 0x2B, 0x0, 0x07, rd, rs1, rs2`
+- `memref.alloc` → `.comm` directive for static allocation in .bss
+- `func.return` → `ret`
 
+**Output for A + B:**
 ```asm
     .globl npu_kernel
     .type npu_kernel, @function
 npu_kernel:
-    # a0 = pointer to input A (src1)
-    # a1 = pointer to input B (src2)
-    # a2 = pointer to output (dst)
-    # a3 = element count (n)
+    # a0 = src1 (A), a1 = src2 (B), a2 = dst (out)
 
-    # Copy src2 to dst (LW/SW loop)
-    # NPU.FVADD rd=a3, rs1=a0, rs2=a2
+    # Copy B to dst (LW/SW loop, needed because FVADD writes in-place to rs2)
+    li t0, 1024           # element count
+    mv t1, a1             # src2 ptr
+    mv t2, a2             # dst ptr
+.Lcopy_0:
+    lw t3, 0(t1)
+    sw t3, 0(t2)
+    addi t1, t1, 4
+    addi t2, t2, 4
+    addi t0, t0, -1
+    bnez t0, .Lcopy_0
+
+    # NPU.FVADD: dst[i] = src1[i] + dst[i]
+    li a3, 1024
     .insn r 0x2B, 0x0, 0x07, a3, a0, a2
 
     ret
 ```
 
-**Register assignment**: Function args arrive in `a0`–`a7` per RISC-V calling convention. The argument order matches the FuncOp signature (inputs first, then output).
+**Register assignment**: Function args in `a0`–`a7` per RISC-V calling convention. Argument order matches the FuncOp signature (inputs first, then output memref). Scratch registers `t0`–`t3` for the copy loop.
 
-**FVADD encoding**: `.insn r 0x2B, 0x0, 0x07, rd, rs1, rs2` — rd=element count, rs1=src1 addr, rs2=src2/dst addr.
-
-For Milestone 1, always emit the copy + insn sequence (simple, correct).
-
-**File**: `src/arrax/codegen/firmware_harness.py`
-
-Generate a `main.c` that:
-- Declares float arrays A[N], B[N], out[N]
-- Initializes A and B with known values
-- Calls `npu_kernel(A, B, out, N)`
-- Prints output as raw IEEE 754 hex bytes via UART (freestanding, no printf)
-
-```c
-void print_float_hex(float f) {
-    unsigned char *bytes = (unsigned char *)&f;
-    for (int i = 3; i >= 0; i--)
-        print_hex_byte(bytes[i]);
-    putchar('\n');
-}
-```
-
-Python `parse_output()` reconstructs via `struct.unpack('!f', bytes.fromhex(line))`.
-
-**File**: `src/arrax/codegen/build.py`
-
-Invoke the toolchain using riscv-npu's common firmware files:
-```python
-RISCV_NPU_DIR = os.environ.get("RISCV_NPU_DIR", "../riscv-npu")
-COMMON_DIR = os.path.join(RISCV_NPU_DIR, "firmware", "common")
-# Uses precompiled start.o, shared linker.ld, syscalls.c
-```
+**FVADD encoding**: `.insn r 0x2B, 0x0, 0x07, rd, rs1, rs2` — rd=element count, rs1=src1 addr, rs2=dst addr (which now contains src2's data after the copy).
 
 **Tests** (`tests/codegen/test_asm_emitter.py`):
 - Generate assembly for `A + B`, verify `.insn r 0x2B, 0x0, 0x07` present
-- Verify assembly contains `.globl`, `ret`, register names
+- Verify assembly contains `.globl npu_kernel`, `ret`
+- Verify copy loop is present (LW/SW pattern)
+- Golden-string snapshot of full output
 
 ### Task 9: End-to-end test — compile, assemble, run, verify
+
+Uses the riscv-npu library API (`from riscv_npu import Emulator`) — no firmware harness generation, no UART parsing. riscv-npu is an editable path dependency.
+
+**Requires**: riscv-npu Phase 12 (library API) implemented + RISC-V toolchain installed.
 
 **File**: `tests/test_end_to_end.py`
 
 ```python
 def test_add_end_to_end():
     import numpy as np
+    from riscv_npu import Emulator
 
     N = 64
     A_data = np.arange(N, dtype=np.float32)
     B_data = np.arange(N, dtype=np.float32) * 2
     expected = A_data + B_data
 
-    # 1. Trace
-    dag, param_names = trace(lambda A, B: A + B, {"A": (N,), "B": (N,)})
+    # 1. Compile: Python DSL → assembly text
+    asm_text = compile_to_asm(lambda A, B: A + B, {"A": (N,), "B": (N,)})
 
-    # 2. Lower through full pipeline
-    module = dsl_to_array(dag, param_names, {"A": (N,), "B": (N,)})
-    ctx = Context()
-    ArrayToLinalgPass().apply(ctx, module)
-    BufferizePass().apply(ctx, module)
-    LinalgToNpuPass().apply(ctx, module)
+    # 2. Assemble: .S → ELF (requires riscv64-unknown-elf-as)
+    elf_path = assemble(asm_text)
 
-    # 3. Emit assembly + firmware harness
-    asm_text = emit_assembly(module)
-    harness_c = generate_harness(A_data, B_data, N)
+    # 3. Run on emulator via library API
+    emu = Emulator()
+    emu.load_elf(elf_path)
+    emu.write_f32("A", A_data)
+    emu.write_f32("B", B_data)
+    result = emu.run()
+    assert result.exit_code == 0
 
-    # 4. Build and run
-    elf_path = build_firmware(asm_text, harness_c)
-    output = run_emulator(elf_path)
-
-    # 5. Compare
-    actual = parse_output(output)
+    # 4. Read output and compare
+    actual = emu.read_f32("out", N)
     np.testing.assert_allclose(actual, expected, rtol=1e-6)
 ```
 
-Requires riscv-npu emulator + RISC-V toolchain installed.
+**Key simplification over original plan**: No `firmware_harness.py`, no `build.py`, no `main.c` generation, no UART hex parsing. The emulator reads/writes arrays directly via `write_f32`/`read_f32` at symbol addresses.
+
+**Still needed**: `assemble()` helper in `src/arrax/codegen/build.py` that invokes `riscv64-unknown-elf-as` to produce an ELF from the `.S` file. The assembly must include data section declarations for the symbol addresses (`.comm A, N*4` etc.) so the emulator can resolve them.
 
 ### Task 10: Pipeline orchestration
 
@@ -246,7 +217,8 @@ Wire everything into a single `compile()` entry point.
 **File**: `src/arrax/pipeline.py`
 
 ```python
-def compile(fn, shapes: dict[str, tuple[int, ...]]) -> CompiledKernel:
+def compile_to_asm(fn, shapes: dict[str, tuple[int, ...]]) -> str:
+    """Full pipeline: trace → lower → emit assembly text."""
     from xdsl.context import Context
     from arrax.dsl.tracer import trace
     from arrax.lowering.dsl_to_array import dsl_to_array
@@ -262,8 +234,7 @@ def compile(fn, shapes: dict[str, tuple[int, ...]]) -> CompiledKernel:
     BufferizePass().apply(ctx, module)
     LinalgToNpuPass().apply(ctx, module)
     module.verify()
-    asm = emit_assembly(module)
-    return CompiledKernel(asm=asm, shapes=shapes)
+    return emit_assembly(module)
 ```
 
 ## Task Dependency Graph
@@ -276,15 +247,16 @@ Task 2 (Array tracing)  ──┼── Task 3 (DSL → array IR) ── Task 4 
                            │                                    │
 Task 6 (npu dialect)  ─────┼──────────────── Task 7 (linalg → npu)
                            │                                    │
-                           │                              Task 8 (npu → asm + harness)
+                           │                              Task 8 (npu → asm)
                            │                                    │
                            │                              Task 9 (end-to-end test)
                            │                                    │
-                           └──────────────── Task 10 (pipeline.compile)
+                           └──────────────── Task 10 (pipeline)
 ```
 
-Tasks 1–6: DONE.
-Task 7 → 8 → 9 → 10: sequential, remaining work.
+Tasks 1–7: DONE.
+Task 8 → 9 → 10: sequential, remaining work.
+Task 9 blocked on riscv-npu Phase 12 (library API).
 
 ## NPU FVADD Encoding Reference
 
@@ -317,8 +289,6 @@ Assembly:    .insn r 0x2B, 0x0, 0x07, a3, a1, a0
 0x800FFFF0  Stack top (ORIGIN + LENGTH - 16, grows downward)
 0x80100000  RAM end (1 MB total)
 ```
-
-Emulator: `uv run python -m riscv_npu run firmware.elf`
 
 ## Verification Strategy
 

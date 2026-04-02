@@ -43,6 +43,7 @@ Python DSL (tracing) -> array dialect -> linalg dialect -> tiling -> fusion
 - Docstrings on all public functions
 - One test file per module, pytest, descriptive names
 - No external deps without logging rationale in .ai/memory.md. Add via uv add <pkg>.
+- No inline imports — put all imports at the top of the file unless strictly necessary
 - Markdown tables must be ASCII-aligned: pad every cell so all rows have identical column widths
 
 ## Key design decisions

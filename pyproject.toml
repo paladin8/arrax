@@ -4,11 +4,15 @@ version = "0.1.0"
 description = "MLIR-based compiler that fuses array expressions in Python and emits optimized RISC-V assembly targeting riscv-npu"
 readme = "README.md"
 license = { file = "LICENSE" }
-requires-python = ">=3.10"
+requires-python = ">=3.14"
 dependencies = [
     "xdsl>=0.58.0",
     "numpy>=1.26.0",
+    "riscv-npu",
 ]
+
+[tool.uv.sources]
+riscv-npu = { path = "../riscv-npu", editable = true }
 
 [dependency-groups]
 dev = [
