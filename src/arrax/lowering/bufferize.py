@@ -35,7 +35,9 @@ class BufferizePass(ModulePass):
         for func_op in list(op.body.block.ops):
             if isinstance(func_op, func.FuncOp):
                 new_func = self._bufferize_func(func_op)
-                func_op.parent.insert_op_after(new_func, func_op)
+                parent_block = func_op.parent
+                assert parent_block is not None
+                parent_block.insert_op_after(new_func, func_op)
                 func_op.detach()
                 func_op.erase()
 
@@ -44,8 +46,14 @@ class BufferizePass(ModulePass):
         assert old_block is not None
 
         # Collect old types
-        old_input_types = list(func_op.function_type.inputs.data)
-        old_output_types = list(func_op.function_type.outputs.data)
+        old_input_types = [
+            t for t in func_op.function_type.inputs.data
+            if isinstance(t, TensorType)
+        ]
+        old_output_types = [
+            t for t in func_op.function_type.outputs.data
+            if isinstance(t, TensorType)
+        ]
 
         memref_inputs = [_tensor_to_memref(t) for t in old_input_types]
         memref_outputs = [_tensor_to_memref(t) for t in old_output_types]
