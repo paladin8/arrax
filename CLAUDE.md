@@ -12,7 +12,7 @@ MLIR-based compiler that fuses array expressions in Python and emits optimized R
 ## Session start
 1. Read this file
 2. Read .ai/memory.md
-3. Read the active phase spec in .ai/plans/
+3. Read the active phase spec/plan in .ai/plans/ (specs and plans live together here)
 
 ## Session end
 1. uv run pytest — confirm passing
