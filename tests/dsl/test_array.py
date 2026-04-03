@@ -51,6 +51,35 @@ class TestArray:
         assert inner.operands[0] is a
         assert inner.operands[1] is b
 
+    def test_sub_creates_dag_node(self) -> None:
+        a = Array("A", (1024,))
+        b = Array("B", (1024,))
+        c = a - b
+
+        assert c.op == "sub"
+        assert not c.is_leaf
+        assert len(c.operands) == 2
+        assert c.operands[0] is a
+        assert c.operands[1] is b
+
+    def test_sub_propagates_shape(self) -> None:
+        a = Array("A", (512,))
+        b = Array("B", (512,))
+        c = a - b
+        assert c.shape == (512,)
+
+    def test_mixed_add_sub(self) -> None:
+        """(A + B) - C builds a mixed DAG."""
+        a = Array("A", (100,))
+        b = Array("B", (100,))
+        c = Array("C", (100,))
+        result = (a + b) - c
+
+        assert result.op == "sub"
+        assert result.operands[1] is c
+        inner = result.operands[0]
+        assert inner.op == "add"
+
     def test_2d_shape(self) -> None:
         a = Array("A", (32, 64))
         b = Array("B", (32, 64))

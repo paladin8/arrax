@@ -24,11 +24,11 @@ from xdsl.pattern_rewriter import (
     op_type_rewrite_pattern,
 )
 
-from arrax.dialects.npu_dialect import FVAddOp
+from arrax.dialects.npu_dialect import FVAddOp, FVSubOp
 
 
-class LinalgAddToNpuPattern(RewritePattern):
-    """Match linalg.generic [addf] on memrefs and replace with npu.fvadd."""
+class LinalgElementwiseToNpuPattern(RewritePattern):
+    """Match linalg.generic elementwise ops on memrefs and replace with NPU ops."""
 
     @op_type_rewrite_pattern
     def match_and_rewrite(
@@ -59,15 +59,22 @@ class LinalgAddToNpuPattern(RewritePattern):
         if op.iterator_types.data[0].data != IteratorType.PARALLEL:
             return
 
-        # Body must be exactly: addf + yield
+        # Body must be exactly: one compute op + yield
         body_block = op.body.blocks.first
         assert body_block is not None
         body_ops = list(body_block.ops)
         if len(body_ops) != 2:
             return
-        if not isinstance(body_ops[0], arith.AddfOp):
-            return
         if not isinstance(body_ops[1], linalg.YieldOp):
+            return
+
+        # Determine which NPU op to emit based on the body compute op
+        compute_op = body_ops[0]
+        if isinstance(compute_op, arith.AddfOp):
+            npu_op_cls = FVAddOp
+        elif isinstance(compute_op, arith.SubfOp):
+            npu_op_cls = FVSubOp
+        else:
             return
 
         # Extract n: static shape → constant, dynamic shape → subview size
@@ -78,17 +85,15 @@ class LinalgAddToNpuPattern(RewritePattern):
         shape_dim: int = src1.type.get_shape()[0]
 
         if shape_dim != DYNAMIC_INDEX:
-            # Static shape: create a constant for n
             n_const = arith.ConstantOp(IntegerAttr(shape_dim, IndexType()))
-            fvadd = FVAddOp(src1, src2, dst, n_const.result)
-            rewriter.replace_matched_op([n_const, fvadd], [])
+            npu_op = npu_op_cls(src1, src2, dst, n_const.result)
+            rewriter.replace_matched_op([n_const, npu_op], [])
         else:
-            # Dynamic shape (post-tiling): get n from the SubviewOp's size
             if not isinstance(src1.owner, memref.SubviewOp):
                 return
             n_ssa = src1.owner.sizes[0]
-            fvadd = FVAddOp(src1, src2, dst, n_ssa)
-            rewriter.replace_matched_op([fvadd], [])
+            npu_op = npu_op_cls(src1, src2, dst, n_ssa)
+            rewriter.replace_matched_op([npu_op], [])
 
 
 @dataclass(frozen=True)
@@ -99,5 +104,5 @@ class LinalgToNpuPass(ModulePass):
 
     def apply(self, ctx: Context, op: ModuleOp) -> None:
         PatternRewriteWalker(
-            GreedyRewritePatternApplier([LinalgAddToNpuPattern()])
+            GreedyRewritePatternApplier([LinalgElementwiseToNpuPattern()])
         ).rewrite_module(op)

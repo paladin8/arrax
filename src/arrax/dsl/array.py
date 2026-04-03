@@ -22,6 +22,12 @@ class Array:
         result.operands = [self, other]
         return result
 
+    def __sub__(self, other: Array) -> Array:
+        result = Array(name="", shape=self.shape)
+        result.op = "sub"
+        result.operands = [self, other]
+        return result
+
     @property
     def is_leaf(self) -> bool:
         return self.op is None

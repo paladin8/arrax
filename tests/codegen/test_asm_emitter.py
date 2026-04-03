@@ -14,7 +14,7 @@ from xdsl.dialects.builtin import (
 from xdsl.ir import Block, Region
 
 from arrax.codegen.asm_emitter import emit_assembly
-from arrax.dialects.npu_dialect import FVAddOp
+from arrax.dialects.npu_dialect import FVAddOp, FVSubOp
 from arrax.dsl.array import Array
 from arrax.lowering.array_to_linalg import ArrayToLinalgPass
 from arrax.lowering.bufferize import BufferizePass
@@ -257,3 +257,33 @@ kernel:
         assert ".comm" in asm
         # S-regs must stay within s0-s11 (no s12+)
         assert "s12" not in asm
+
+    def test_basic_sub(self) -> None:
+        """A - B: uses FVSUB funct7=0x08."""
+        module = make_module(lambda A, B: A - B, {"A": (64,), "B": (64,)})
+        asm = _to_asm(module)
+        assert ".insn r 0x2B, 0x0, 0x08" in asm
+        assert "NPU.FVSUB" in asm
+
+    def test_sub_has_copy_loop(self) -> None:
+        """FVSUB needs copy loop like FVADD (hardware writes in-place to rs2)."""
+        module = make_module(lambda A, B: A - B, {"A": (64,), "B": (64,)})
+        asm = _to_asm(module)
+        assert ".Lcopy_" in asm
+
+    def test_mixed_add_sub(self) -> None:
+        """(A + B) - C: one FVADD and one FVSUB."""
+        def kernel(A: Array, B: Array, C: Array) -> Array:
+            return (A + B) - C
+
+        module = make_module(kernel, {"A": (32,), "B": (32,), "C": (32,)})
+        asm = _to_asm(module)
+        assert ".insn r 0x2B, 0x0, 0x07" in asm  # FVADD
+        assert ".insn r 0x2B, 0x0, 0x08" in asm  # FVSUB
+
+    def test_tiled_sub(self) -> None:
+        """Tiled subtraction produces loop with FVSUB."""
+        module = make_module(lambda A, B: A - B, {"A": (128,), "B": (128,)})
+        asm = _to_asm_tiled(module)
+        assert ".Lfor_" in asm
+        assert ".insn r 0x2B, 0x0, 0x08" in asm

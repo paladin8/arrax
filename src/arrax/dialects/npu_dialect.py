@@ -74,4 +74,57 @@ class FVAddOp(IRDLOperation):
                     )
 
 
-NPUDialect = Dialect("npu", [FVAddOp], [])
+@irdl_op_definition
+class FVSubOp(IRDLOperation):
+    """Elementwise vector subtraction: dst[i] = src1[i] - src2[i].
+
+    Maps to NPU.FVSUB (opcode=0x2B, funct7=0x08).
+    """
+
+    name = "npu.fvsub"
+
+    src1 = operand_def(MemRefType)
+    src2 = operand_def(MemRefType)
+    dst = operand_def(MemRefType)
+    n = operand_def(IndexType)
+
+    assembly_format = (
+        "$src1 `,` $src2 `,` $dst `,` $n attr-dict"
+        " `:` type($src1) `,` type($src2) `,` type($dst) `,` type($n)"
+    )
+
+    def __init__(
+        self,
+        src1: SSAValue | Operation,
+        src2: SSAValue | Operation,
+        dst: SSAValue | Operation,
+        n: SSAValue | Operation,
+    ) -> None:
+        super().__init__(operands=[src1, src2, dst, n], result_types=[])
+
+    def verify_(self) -> None:
+        src1_type = self.src1.type
+        src2_type = self.src2.type
+        dst_type = self.dst.type
+        if src1_type != src2_type or src1_type != dst_type:
+            raise VerifyException(
+                f"npu.fvsub: all memref operands must have the same type, "
+                f"got {src1_type}, {src2_type}, {dst_type}"
+            )
+        assert isinstance(src1_type, MemRefType)
+        if not isinstance(src1_type.element_type, Float32Type):
+            raise VerifyException(
+                f"npu.fvsub: expected f32 element type, got {src1_type.element_type}"
+            )
+        if isinstance(self.n.owner, arith.ConstantOp):
+            n_attr = self.n.owner.value
+            if isinstance(n_attr, IntegerAttr):
+                n_val = n_attr.value.data
+                if n_val > NPU_MAX_VEC_LEN:
+                    raise VerifyException(
+                        f"npu.fvsub: n={n_val} exceeds NPU vector length "
+                        f"limit ({NPU_MAX_VEC_LEN})"
+                    )
+
+
+NPUDialect = Dialect("npu", [FVAddOp, FVSubOp], [])

@@ -66,6 +66,26 @@ builtin.module {
         assert ir.count("linalg.generic") == 1
         assert "array.add" not in ir
 
+    def test_basic_sub(self) -> None:
+        module = make_module(lambda A, B: A - B, {"A": (1024,), "B": (1024,)})
+        lower_to_linalg(module)
+        ir = str(module)
+        assert "arith.subf" in ir
+        assert "linalg.generic" in ir
+        assert "array.sub" not in ir
+
+    def test_mixed_add_sub(self) -> None:
+        """(A + B) - C produces one addf generic and one subf generic."""
+        def kernel(A: Array, B: Array, C: Array) -> Array:
+            return (A + B) - C
+
+        module = make_module(kernel, {"A": (32,), "B": (32,), "C": (32,)})
+        lower_to_linalg(module)
+        ir = str(module)
+        assert ir.count("linalg.generic") == 2
+        assert "arith.addf" in ir
+        assert "arith.subf" in ir
+
     def test_2d_tensor(self) -> None:
         """Lowering generalizes to multi-dimensional tensors."""
         module = make_module(lambda A, B: A + B, {"A": (8, 16), "B": (8, 16)})

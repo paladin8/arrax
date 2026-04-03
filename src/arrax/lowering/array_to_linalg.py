@@ -24,7 +24,7 @@ from xdsl.pattern_rewriter import (
     op_type_rewrite_pattern,
 )
 
-from arrax.dialects.array_dialect import AddOp
+from arrax.dialects.array_dialect import AddOp, SubOp
 
 
 class AddToLinalgPattern(RewritePattern):
@@ -64,6 +64,40 @@ class AddToLinalgPattern(RewritePattern):
         rewriter.replace_matched_op([empty, generic], [generic.res[0]])
 
 
+class SubToLinalgPattern(RewritePattern):
+    """Rewrite array.sub to linalg.generic with arith.subf body."""
+
+    @op_type_rewrite_pattern
+    def match_and_rewrite(self, op: SubOp, rewriter: PatternRewriter) -> None:
+        result_type = op.result.type
+        assert isinstance(result_type, TensorType)
+        f32 = Float32Type()
+
+        empty = tensor.EmptyOp([], result_type)
+
+        ndims = len(result_type.get_shape())
+        identity = AffineMap.identity(ndims)
+        maps = [AffineMapAttr(identity)] * 3
+        iters = [IteratorTypeAttr.parallel() for _ in range(ndims)]
+
+        scalar_types = [f32] * 3
+        block = Block(arg_types=scalar_types)
+        sub = arith.SubfOp(block.args[0], block.args[1])
+        yield_op = linalg.YieldOp(sub.result)
+        block.add_ops([sub, yield_op])
+        body = Region([block])
+
+        generic = linalg.GenericOp(
+            inputs=[op.lhs, op.rhs],
+            outputs=[empty.tensor],
+            body=body,
+            indexing_maps=maps,
+            iterator_types=iters,
+            result_types=[result_type],
+        )
+        rewriter.replace_matched_op([empty, generic], [generic.res[0]])
+
+
 @dataclass(frozen=True)
 class ArrayToLinalgPass(ModulePass):
     """Lower array dialect ops to linalg.generic on tensors."""
@@ -72,5 +106,7 @@ class ArrayToLinalgPass(ModulePass):
 
     def apply(self, ctx: Context, op: ModuleOp) -> None:
         PatternRewriteWalker(
-            GreedyRewritePatternApplier([AddToLinalgPattern()])
+            GreedyRewritePatternApplier(
+                [AddToLinalgPattern(), SubToLinalgPattern()]
+            )
         ).rewrite_module(op)

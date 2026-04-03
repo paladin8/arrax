@@ -22,7 +22,7 @@ from xdsl.dialects import arith, func, memref, scf
 from xdsl.dialects.builtin import IntegerAttr, MemRefType, ModuleOp
 from xdsl.ir import Block, Operation, SSAValue
 
-from arrax.dialects.npu_dialect import FVAddOp
+from arrax.dialects.npu_dialect import FVAddOp, FVSubOp
 
 # t-registers for loop-body-local values that die before the copy loop.
 # t0-t3 are reserved as scratch for copy loops and constant loading.
@@ -169,7 +169,9 @@ class _AsmEmitter:
         elif isinstance(op, memref.AllocOp):
             self._emit_alloc(op)
         elif isinstance(op, FVAddOp):
-            self._emit_fvadd(op)
+            self._emit_fv_binop(op, "FVADD", 0x07)
+        elif isinstance(op, FVSubOp):
+            self._emit_fv_binop(op, "FVSUB", 0x08)
         elif isinstance(op, scf.ForOp):
             self._emit_for(op)
         elif isinstance(op, memref.SubviewOp):
@@ -301,8 +303,10 @@ class _AsmEmitter:
         self._lines.append(f"{done_label}:")
         self._reg_map[id(op.result)] = result_reg
 
-    def _emit_fvadd(self, op: FVAddOp) -> None:
-        """Emit .insn for NPU FVADD, with copy loop if src2 != dst.
+    def _emit_fv_binop(
+        self, op: FVAddOp | FVSubOp, name: str, funct7: int
+    ) -> None:
+        """Emit .insn for a binary NPU op, with copy loop if src2 != dst.
 
         The hardware writes in-place to rs2. If src2 and dst are the same
         buffer, no copy is needed. Otherwise, copy src2 -> dst first.
@@ -311,6 +315,7 @@ class _AsmEmitter:
         src2 = self._reg(op.src2)
         dst = self._reg(op.dst)
         n_is_const = id(op.n) in self._const_map
+        funct7_hex = f"0x{funct7:02X}"
 
         # Copy src2 -> dst only if they're different buffers
         if op.src2 is not op.dst:
@@ -338,11 +343,18 @@ class _AsmEmitter:
             self._lines.append(f"    bnez t0, {loop_label}")
             self._lines.append(f"{done_label}:")
 
-        # NPU.FVADD: rd=n, rs1=src1, rs2=dst (now contains src2 data)
-        self._lines.append(f"    # NPU.FVADD {dst}[i] = {src1}[i] + {dst}[i]")
+        # NPU instruction: rd=n, rs1=src1, rs2=dst (now contains src2 data)
+        op_symbol = "+" if isinstance(op, FVAddOp) else "-"
+        self._lines.append(
+            f"    # NPU.{name} {dst}[i] = {src1}[i] {op_symbol} {dst}[i]"
+        )
         if n_is_const:
             self._lines.append(f"    li t0, {self._const(op.n)}")
-            self._lines.append(f"    .insn r 0x2B, 0x0, 0x07, t0, {src1}, {dst}")
+            self._lines.append(
+                f"    .insn r 0x2B, 0x0, {funct7_hex}, t0, {src1}, {dst}"
+            )
         else:
             n_reg = self._reg(op.n)
-            self._lines.append(f"    .insn r 0x2B, 0x0, 0x07, {n_reg}, {src1}, {dst}")
+            self._lines.append(
+                f"    .insn r 0x2B, 0x0, {funct7_hex}, {n_reg}, {src1}, {dst}"
+            )

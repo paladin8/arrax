@@ -166,6 +166,40 @@ builtin.module {
         assert "npu.fvadd" in ir
         assert "linalg.generic" not in ir
 
+    def test_basic_sub(self) -> None:
+        module = make_module(lambda A, B: A - B, {"A": (64,), "B": (64,)})
+        _lower_to_npu(module)
+        ir = str(module)
+        assert "npu.fvsub" in ir
+        assert "linalg.generic" not in ir
+
+    def test_sub_n_constant_matches_shape(self) -> None:
+        module = make_module(lambda A, B: A - B, {"A": (48,), "B": (48,)})
+        _lower_to_npu(module)
+        ir = str(module)
+        assert "arith.constant 48 : index" in ir
+        assert "npu.fvsub" in ir
+
+    def test_mixed_add_sub(self) -> None:
+        """(A + B) - C produces one fvadd and one fvsub."""
+        def kernel(A: Array, B: Array, C: Array) -> Array:
+            return (A + B) - C
+
+        module = make_module(kernel, {"A": (32,), "B": (32,), "C": (32,)})
+        _lower_to_npu(module)
+        ir = str(module)
+        assert "npu.fvadd" in ir
+        assert "npu.fvsub" in ir
+        assert "linalg.generic" not in ir
+
+    def test_tiled_sub(self) -> None:
+        """n=128 sub with tiling."""
+        module = make_module(lambda A, B: A - B, {"A": (128,), "B": (128,)})
+        _lower_to_npu_with_tiling(module)
+        ir = str(module)
+        assert "npu.fvsub" in ir
+        assert "scf.for" in ir
+
     def test_tiled_no_arith_constant_for_n(self) -> None:
         """After tiling, n comes from minsi — no new arith.constant for element count."""
         module = make_module(lambda A, B: A + B, {"A": (128,), "B": (128,)})

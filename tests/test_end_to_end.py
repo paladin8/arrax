@@ -144,6 +144,56 @@ class TestEndToEnd:
         )
         np.testing.assert_allclose(actual, expected, rtol=1e-6)
 
+    def test_sub(self, tmp_path: Path) -> None:
+        """A - B: basic elementwise subtraction."""
+        N = 128
+        A = np.arange(N, dtype=np.float32) * 3
+        B = np.arange(N, dtype=np.float32)
+        expected = A - B
+
+        actual, _ = _compile_and_run(
+            lambda A, B: A - B,
+            {"A": (N,), "B": (N,)},
+            {"A": A, "B": B},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-6)
+
+    def test_sub_negative_result(self, tmp_path: Path) -> None:
+        """A - B where result has negative values."""
+        N = 64
+        A = np.ones(N, dtype=np.float32)
+        B = np.ones(N, dtype=np.float32) * 5
+        expected = A - B
+
+        actual, _ = _compile_and_run(
+            lambda A, B: A - B,
+            {"A": (N,), "B": (N,)},
+            {"A": A, "B": B},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-6)
+
+    def test_add_then_sub(self, tmp_path: Path) -> None:
+        """(A + B) - C: mixed add and sub."""
+        N = 100
+
+        def kernel(A: Array, B: Array, C: Array) -> Array:
+            return (A + B) - C
+
+        A = np.arange(N, dtype=np.float32)
+        B = np.ones(N, dtype=np.float32) * 10
+        C = np.ones(N, dtype=np.float32) * 3
+        expected = (A + B) - C
+
+        actual, _ = _compile_and_run(
+            kernel,
+            {"A": (N,), "B": (N,), "C": (N,)},
+            {"A": A, "B": B, "C": C},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-6)
+
     def test_reports_cycles(self, tmp_path: Path) -> None:
         """Emulator reports nonzero cycle count."""
         N = 16

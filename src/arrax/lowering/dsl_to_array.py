@@ -6,7 +6,7 @@ from xdsl.dialects.builtin import Float32Type, ModuleOp, TensorType
 from xdsl.dialects.func import FuncOp, ReturnOp
 from xdsl.ir import SSAValue
 
-from arrax.dialects.array_dialect import AddOp
+from arrax.dialects.array_dialect import AddOp, SubOp
 from arrax.dsl.array import Array
 
 
@@ -54,6 +54,12 @@ def dsl_to_array(
             add_op = AddOp(lhs, rhs)
             entry_block.add_op(add_op)
             val = add_op.result
+        elif node.op == "sub":
+            lhs = lower(node.operands[0])
+            rhs = lower(node.operands[1])
+            sub_op = SubOp(lhs, rhs)
+            entry_block.add_op(sub_op)
+            val = sub_op.result
         else:
             raise ValueError(f"unsupported operation: {node.op}")
 

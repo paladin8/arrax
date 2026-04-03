@@ -8,7 +8,7 @@ from xdsl.dialects.builtin import Float32Type, ModuleOp, TensorType
 from xdsl.utils.exceptions import VerifyException
 from xdsl.utils.test_value import create_ssa_value
 
-from arrax.dialects.array_dialect import AddOp, ArrayDialect
+from arrax.dialects.array_dialect import AddOp, ArrayDialect, SubOp
 
 
 class TestArrayDialect:
@@ -17,6 +17,9 @@ class TestArrayDialect:
 
     def test_dialect_contains_add(self) -> None:
         assert AddOp in ArrayDialect._operations
+
+    def test_dialect_contains_sub(self) -> None:
+        assert SubOp in ArrayDialect._operations
 
 
 class TestAddOp:
@@ -113,3 +116,43 @@ builtin.module {
         ctx.load_dialect(Func)
         module = Parser(ctx, ir_text).parse_module()
         module.verify()
+
+
+class TestSubOp:
+    def test_construction(self) -> None:
+        tensor_type = TensorType(Float32Type(), [1024])
+        lhs = create_ssa_value(tensor_type)
+        rhs = create_ssa_value(tensor_type)
+        op = SubOp(lhs, rhs)
+
+        assert op.lhs == lhs
+        assert op.rhs == rhs
+        assert op.result.type == tensor_type
+
+    def test_verify_matching_types(self) -> None:
+        tensor_type = TensorType(Float32Type(), [1024])
+        lhs = create_ssa_value(tensor_type)
+        rhs = create_ssa_value(tensor_type)
+        op = SubOp(lhs, rhs)
+        op.verify()
+
+    def test_verify_mismatched_shapes_fails(self) -> None:
+        type_a = TensorType(Float32Type(), [1024])
+        type_b = TensorType(Float32Type(), [512])
+        lhs = create_ssa_value(type_a)
+        rhs = create_ssa_value(type_b)
+        op = SubOp(lhs, rhs)
+
+        with pytest.raises(VerifyException, match="operand types must match"):
+            op.verify()
+
+    def test_ir_prints_correctly(self) -> None:
+        tensor_type = TensorType(Float32Type(), [1024])
+        lhs = create_ssa_value(tensor_type)
+        rhs = create_ssa_value(tensor_type)
+        op = SubOp(lhs, rhs)
+        module = ModuleOp([lhs.owner, rhs.owner, op])
+
+        ir_text = str(module)
+        assert "array.sub" in ir_text
+        assert "tensor<1024xf32>, tensor<1024xf32> -> tensor<1024xf32>" in ir_text
