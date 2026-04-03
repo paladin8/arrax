@@ -210,34 +210,23 @@ def test_add_end_to_end():
 
 **Still needed**: `assemble()` helper in `src/arrax/codegen/build.py` that invokes `riscv64-unknown-elf-as` to produce an ELF from the `.S` file. The assembly must include data section declarations for the symbol addresses (`.comm A, N*4` etc.) so the emulator can resolve them.
 
-### Task 10: Pipeline orchestration
-
-Wire everything into a single `compile()` entry point.
+### Task 10: Pipeline orchestration (DONE)
 
 **File**: `src/arrax/pipeline.py`
 
-```python
-def compile_to_asm(fn, shapes: dict[str, tuple[int, ...]]) -> str:
-    """Full pipeline: trace → lower → emit assembly text."""
-    from xdsl.context import Context
-    from arrax.dsl.tracer import trace
-    from arrax.lowering.dsl_to_array import dsl_to_array
-    from arrax.lowering.array_to_linalg import ArrayToLinalgPass
-    from arrax.lowering.bufferize import BufferizePass
-    from arrax.lowering.linalg_to_npu import LinalgToNpuPass
-    from arrax.codegen.asm_emitter import emit_assembly
+- `compile_to_asm(fn, shapes)` returns `(assembly_text, param_names)`
+- Chains: trace → dsl_to_array → ArrayToLinalg → Bufferize → LinalgToNpu → NpuCanonicalize → verify → emit_assembly
+- Exported from `arrax.__init__` alongside `Array`
 
-    dag, param_names = trace(fn, shapes)
-    module = dsl_to_array(dag, param_names, shapes)
-    ctx = Context()
-    ArrayToLinalgPass().apply(ctx, module)
-    BufferizePass().apply(ctx, module)
-    LinalgToNpuPass().apply(ctx, module)
-    module.verify()
-    return emit_assembly(module)
-```
+**File**: `src/arrax/codegen/build.py`
+
+- `build_elf(kernel_asm, param_names, shapes, output_dir)` wraps kernel with main wrapper + .comm data declarations
+- Assembles and links via `riscv64-unknown-elf-gcc` against riscv-npu's `start.o` and `linker.ld`
+- Argument count guard (max 8 for a0-a7)
 
 ## Task Dependency Graph
+
+All tasks complete.
 
 ```
 Task 1 (array dialect)  ──┐
@@ -253,10 +242,6 @@ Task 6 (npu dialect)  ─────┼─────────────�
                            │                                    │
                            └──────────────── Task 10 (pipeline)
 ```
-
-Tasks 1–7: DONE.
-Task 8 → 9 → 10: sequential, remaining work.
-Task 9 blocked on riscv-npu Phase 12 (library API).
 
 ## NPU FVADD Encoding Reference
 
