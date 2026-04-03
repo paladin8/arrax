@@ -11,9 +11,10 @@ from arrax.dsl.array import Array
 from arrax.dsl.tracer import trace
 from arrax.lowering.array_to_linalg import ArrayToLinalgPass
 from arrax.lowering.bufferize import BufferizePass
-from arrax.lowering.linalg_to_npu import LinalgToNpuPass
 from arrax.lowering.dsl_to_array import dsl_to_array
+from arrax.lowering.linalg_to_npu import LinalgToNpuPass
 from arrax.lowering.npu_canonicalize import NpuCanonicalizePass
+from arrax.lowering.tile import TilePass
 
 
 def compile_to_asm(
@@ -30,6 +31,7 @@ def compile_to_asm(
     ctx = Context()
     ArrayToLinalgPass().apply(ctx, module)
     BufferizePass().apply(ctx, module)
+    TilePass().apply(ctx, module)
     LinalgToNpuPass().apply(ctx, module)
     NpuCanonicalizePass().apply(ctx, module)
     module.verify()

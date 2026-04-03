@@ -5,13 +5,16 @@ from __future__ import annotations
 from xdsl.context import Context
 
 from arrax.dsl.array import Array
+from xdsl.dialects.builtin import ModuleOp
+
 from arrax.lowering.array_to_linalg import ArrayToLinalgPass
 from arrax.lowering.bufferize import BufferizePass
 from arrax.lowering.linalg_to_npu import LinalgToNpuPass
+from arrax.lowering.tile import TilePass
 from tests.helpers import make_module
 
 
-def _lower_to_npu(module):
+def _lower_to_npu(module: ModuleOp) -> ModuleOp:
     """Apply full pipeline: array-to-linalg, bufferize, linalg-to-npu."""
     ctx = Context()
     ArrayToLinalgPass().apply(ctx, module)
@@ -21,16 +24,27 @@ def _lower_to_npu(module):
     return module
 
 
+def _lower_to_npu_with_tiling(module: ModuleOp) -> ModuleOp:
+    """Apply full pipeline with tiling: array-to-linalg, bufferize, tile, linalg-to-npu."""
+    ctx = Context()
+    ArrayToLinalgPass().apply(ctx, module)
+    BufferizePass().apply(ctx, module)
+    TilePass().apply(ctx, module)
+    LinalgToNpuPass().apply(ctx, module)
+    module.verify()
+    return module
+
+
 class TestLinalgToNpu:
     def test_basic_add(self) -> None:
-        module = make_module(lambda A, B: A + B, {"A": (1024,), "B": (1024,)})
+        module = make_module(lambda A, B: A + B, {"A": (64,), "B": (64,)})
         _lower_to_npu(module)
 
         expected = """\
 builtin.module {
-  func.func @kernel(%0: memref<1024xf32>, %1: memref<1024xf32>, %2: memref<1024xf32>) {
-    %3 = arith.constant 1024 : index
-    npu.fvadd %0, %1, %2, %3 : memref<1024xf32>, memref<1024xf32>, memref<1024xf32>, index
+  func.func @kernel(%0: memref<64xf32>, %1: memref<64xf32>, %2: memref<64xf32>) {
+    %3 = arith.constant 64 : index
+    npu.fvadd %0, %1, %2, %3 : memref<64xf32>, memref<64xf32>, memref<64xf32>, index
     func.return
   }
 }"""
@@ -57,16 +71,16 @@ builtin.module {
         assert "memref.alloc" in ir
 
     def test_n_constant_matches_shape(self) -> None:
-        module = make_module(lambda A, B: A + B, {"A": (256,), "B": (256,)})
+        module = make_module(lambda A, B: A + B, {"A": (48,), "B": (48,)})
         _lower_to_npu(module)
         ir = str(module)
-        assert "arith.constant 256 : index" in ir
+        assert "arith.constant 48 : index" in ir
 
     def test_different_shape(self) -> None:
-        module = make_module(lambda X, Y: X + Y, {"X": (512,), "Y": (512,)})
+        module = make_module(lambda X, Y: X + Y, {"X": (32,), "Y": (32,)})
         _lower_to_npu(module)
         ir = str(module)
-        assert "memref<512xf32>" in ir
+        assert "memref<32xf32>" in ir
         assert "npu.fvadd" in ir
 
     def test_diamond_dag(self) -> None:
@@ -134,3 +148,30 @@ builtin.module {
         assert "linalg.generic" in ir
         assert "arith.mulf" in ir
         assert "npu.fvadd" not in ir
+
+    def test_tiled_basic(self) -> None:
+        """n=128 with tiling: npu.fvadd uses dynamic chunk size from subview."""
+        module = make_module(lambda A, B: A + B, {"A": (128,), "B": (128,)})
+        _lower_to_npu_with_tiling(module)
+        ir = str(module)
+        assert "npu.fvadd" in ir
+        assert "linalg.generic" not in ir
+        assert "scf.for" in ir
+
+    def test_tiled_non_multiple(self) -> None:
+        """n=100 with tiling: handles remainder chunk."""
+        module = make_module(lambda A, B: A + B, {"A": (100,), "B": (100,)})
+        _lower_to_npu_with_tiling(module)
+        ir = str(module)
+        assert "npu.fvadd" in ir
+        assert "linalg.generic" not in ir
+
+    def test_tiled_no_arith_constant_for_n(self) -> None:
+        """After tiling, n comes from minsi — no new arith.constant for element count."""
+        module = make_module(lambda A, B: A + B, {"A": (128,), "B": (128,)})
+        _lower_to_npu_with_tiling(module)
+        ir = str(module)
+        # The fvadd's n operand should reference the minsi result,
+        # not a new constant
+        assert "arith.minsi" in ir
+        assert "npu.fvadd" in ir

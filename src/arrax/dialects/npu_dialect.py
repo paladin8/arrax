@@ -7,7 +7,8 @@ the hardware's in-place semantics (copy + insn when dst != src2).
 
 from __future__ import annotations
 
-from xdsl.dialects.builtin import Float32Type, IndexType, MemRefType
+from xdsl.dialects import arith
+from xdsl.dialects.builtin import Float32Type, IndexType, IntegerAttr, MemRefType
 from xdsl.ir import Dialect, Operation, SSAValue
 from xdsl.irdl import (
     IRDLOperation,
@@ -15,6 +16,8 @@ from xdsl.irdl import (
     operand_def,
 )
 from xdsl.utils.exceptions import VerifyException
+
+NPU_MAX_VEC_LEN = 64
 
 
 @irdl_op_definition
@@ -59,6 +62,16 @@ class FVAddOp(IRDLOperation):
             raise VerifyException(
                 f"npu.fvadd: expected f32 element type, got {src1_type.element_type}"
             )
+        # When n is a known constant, enforce the hardware vector length limit
+        if isinstance(self.n.owner, arith.ConstantOp):
+            n_attr = self.n.owner.value
+            if isinstance(n_attr, IntegerAttr):
+                n_val = n_attr.value.data
+                if n_val > NPU_MAX_VEC_LEN:
+                    raise VerifyException(
+                        f"npu.fvadd: n={n_val} exceeds NPU vector length "
+                        f"limit ({NPU_MAX_VEC_LEN})"
+                    )
 
 
 NPUDialect = Dialect("npu", [FVAddOp], [])

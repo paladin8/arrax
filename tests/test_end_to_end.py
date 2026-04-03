@@ -36,8 +36,8 @@ def _compile_and_run(
 
 class TestEndToEnd:
     def test_add(self, tmp_path: Path) -> None:
-        """A + B: basic elementwise addition."""
-        N = 64
+        """A + B: basic elementwise addition with tiling (N > 64)."""
+        N = 128
         A = np.arange(N, dtype=np.float32)
         B = np.arange(N, dtype=np.float32) * 2
         expected = A + B
@@ -84,6 +84,36 @@ class TestEndToEnd:
         N = 32
         A = np.arange(N, dtype=np.float32)
         B = np.zeros(N, dtype=np.float32)
+        expected = A + B
+
+        actual, _ = _compile_and_run(
+            lambda A, B: A + B,
+            {"A": (N,), "B": (N,)},
+            {"A": A, "B": B},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-6)
+
+    def test_add_non_multiple(self, tmp_path: Path) -> None:
+        """A + B with N=100: exercises tiling remainder path."""
+        N = 100
+        A = np.arange(N, dtype=np.float32)
+        B = np.arange(N, dtype=np.float32) * 0.5
+        expected = A + B
+
+        actual, _ = _compile_and_run(
+            lambda A, B: A + B,
+            {"A": (N,), "B": (N,)},
+            {"A": A, "B": B},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-6)
+
+    def test_add_large(self, tmp_path: Path) -> None:
+        """A + B with N=1024: many tiling iterations."""
+        N = 1024
+        A = np.arange(N, dtype=np.float32)
+        B = np.ones(N, dtype=np.float32) * 3.14
         expected = A + B
 
         actual, _ = _compile_and_run(

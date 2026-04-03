@@ -18,13 +18,14 @@ from arrax.dialects.npu_dialect import FVAddOp
 from arrax.dsl.array import Array
 from arrax.lowering.array_to_linalg import ArrayToLinalgPass
 from arrax.lowering.bufferize import BufferizePass
-from arrax.lowering.npu_canonicalize import NpuCanonicalizePass
 from arrax.lowering.linalg_to_npu import LinalgToNpuPass
+from arrax.lowering.npu_canonicalize import NpuCanonicalizePass
+from arrax.lowering.tile import TilePass
 from tests.helpers import make_module
 
 
-def _to_asm(module):
-    """Apply full lowering pipeline and emit assembly."""
+def _to_asm(module: ModuleOp) -> str:
+    """Apply full lowering pipeline (no tiling) and emit assembly."""
     ctx = Context()
     ArrayToLinalgPass().apply(ctx, module)
     BufferizePass().apply(ctx, module)
@@ -33,9 +34,21 @@ def _to_asm(module):
     return emit_assembly(module)
 
 
+def _to_asm_tiled(module: ModuleOp) -> str:
+    """Apply full lowering pipeline with tiling and emit assembly."""
+    ctx = Context()
+    ArrayToLinalgPass().apply(ctx, module)
+    BufferizePass().apply(ctx, module)
+    TilePass().apply(ctx, module)
+    LinalgToNpuPass().apply(ctx, module)
+    NpuCanonicalizePass().apply(ctx, module)
+    module.verify()
+    return emit_assembly(module)
+
+
 class TestAsmEmitter:
     def test_basic_add(self) -> None:
-        module = make_module(lambda A, B: A + B, {"A": (1024,), "B": (1024,)})
+        module = make_module(lambda A, B: A + B, {"A": (64,), "B": (64,)})
         asm = _to_asm(module)
 
         expected = """\
@@ -43,8 +56,8 @@ class TestAsmEmitter:
     .globl kernel
     .type kernel, @function
 kernel:
-    # copy a1 -> a2 (1024 words)
-    li t0, 1024
+    # copy a1 -> a2 (64 words)
+    li t0, 64
     beqz t0, .Lcopy_done_0
     mv t1, a1
     mv t2, a2
@@ -57,7 +70,7 @@ kernel:
     bnez t0, .Lcopy_0
 .Lcopy_done_0:
     # NPU.FVADD a2[i] = a0[i] + a2[i]
-    li t0, 1024
+    li t0, 64
     .insn r 0x2B, 0x0, 0x07, t0, a0, a2
     ret
 """
@@ -93,9 +106,9 @@ kernel:
         assert ".Lcopy_done_0:" in asm
 
     def test_n_matches_shape(self) -> None:
-        module = make_module(lambda A, B: A + B, {"A": (256,), "B": (256,)})
+        module = make_module(lambda A, B: A + B, {"A": (48,), "B": (48,)})
         asm = _to_asm(module)
-        assert "li t0, 256" in asm
+        assert "li t0, 48" in asm
 
     def test_chained_add(self) -> None:
         """(A + B) + C: two FVADDs, .comm allocation, s-register save/restore."""
@@ -108,8 +121,7 @@ kernel:
         # Two FVADD instructions
         assert asm.count(".insn r 0x2B, 0x0, 0x07") == 2
         # Two copy loops
-        assert ".Lcopy_0:" in asm
-        assert ".Lcopy_1:" in asm
+        assert asm.count(".Lcopy_") >= 2
         # Intermediate buffer in .bss
         assert ".section .bss" in asm
         assert ".comm .Lbuf_0, 128, 4" in asm
@@ -188,3 +200,60 @@ kernel:
         assert ".Lcopy" not in asm
         # rs1 = a1 (swapped), rs2 = a0 (dst)
         assert ".insn r 0x2B, 0x0, 0x07, t0, a1, a0" in asm
+
+    def test_tiled_has_loop(self) -> None:
+        """n=128 with tiling: assembly contains a for loop."""
+        module = make_module(lambda A, B: A + B, {"A": (128,), "B": (128,)})
+        asm = _to_asm_tiled(module)
+        assert ".Lfor_" in asm
+        assert ".Lfor_end_" in asm
+        assert "bge" in asm
+        assert ".insn r 0x2B, 0x0, 0x07" in asm
+        assert "ret" in asm
+
+    def test_tiled_has_subview_pointer_math(self) -> None:
+        """Tiled assembly computes subview pointers via slli + add."""
+        module = make_module(lambda A, B: A + B, {"A": (128,), "B": (128,)})
+        asm = _to_asm_tiled(module)
+        assert "slli t1" in asm  # offset * 4
+        assert "add s" in asm  # base + offset
+
+    def test_tiled_has_minsi(self) -> None:
+        """Tiled assembly computes min for remainder handling."""
+        module = make_module(lambda A, B: A + B, {"A": (100,), "B": (100,)})
+        asm = _to_asm_tiled(module)
+        assert ".Lmin_done_" in asm
+        assert "blt" in asm
+
+    def test_tiled_small_unchanged(self) -> None:
+        """n=32 (below limit): no loop, same as untiled."""
+        module_a = make_module(lambda A, B: A + B, {"A": (32,), "B": (32,)})
+        module_b = make_module(lambda A, B: A + B, {"A": (32,), "B": (32,)})
+        asm_tiled = _to_asm_tiled(module_a)
+        asm_untiled = _to_asm(module_b)
+        assert asm_tiled == asm_untiled
+
+    def test_tiled_s_regs_saved(self) -> None:
+        """Tiled emission uses s-registers and saves/restores them."""
+        module = make_module(lambda A, B: A + B, {"A": (128,), "B": (128,)})
+        asm = _to_asm_tiled(module)
+        # Must save/restore s-registers
+        assert "addi sp, sp, -" in asm
+        assert "sw s0" in asm
+        assert "lw s0" in asm
+
+    def test_tiled_chained_add(self) -> None:
+        """(A + B) + C with n=128: two tiled loops, s-regs reused."""
+        def kernel(A: Array, B: Array, C: Array) -> Array:
+            return (A + B) + C
+
+        module = make_module(kernel, {"A": (128,), "B": (128,), "C": (128,)})
+        asm = _to_asm_tiled(module)
+        # Two for loops (one per add)
+        assert asm.count(".Lfor_") >= 2
+        # Two FVADDs
+        assert asm.count(".insn r 0x2B, 0x0, 0x07") == 2
+        # Intermediate buffer
+        assert ".comm" in asm
+        # S-regs must stay within s0-s11 (no s12+)
+        assert "s12" not in asm

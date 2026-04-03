@@ -5,13 +5,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from xdsl.context import Context
-from xdsl.dialects import arith, linalg
+from xdsl.dialects import arith, linalg, memref
 from xdsl.dialects.builtin import (
+    DYNAMIC_INDEX,
     IndexType,
     IntegerAttr,
     MemRefType,
     ModuleOp,
 )
+from xdsl.dialects.linalg import IteratorType
 from xdsl.ir.affine import AffineMap
 from xdsl.passes import ModulePass
 from xdsl.pattern_rewriter import (
@@ -54,8 +56,6 @@ class LinalgAddToNpuPattern(RewritePattern):
         # Single parallel iterator
         if len(op.iterator_types.data) != 1:
             return
-        from xdsl.dialects.linalg import IteratorType
-
         if op.iterator_types.data[0].data != IteratorType.PARALLEL:
             return
 
@@ -70,20 +70,25 @@ class LinalgAddToNpuPattern(RewritePattern):
         if not isinstance(body_ops[1], linalg.YieldOp):
             return
 
-        # Extract n from the memref shape
+        # Extract n: static shape → constant, dynamic shape → subview size
         src1 = inputs[0]
         src2 = inputs[1]
         dst = outputs[0]
         assert isinstance(src1.type, MemRefType)
-        n_val: int = src1.type.get_shape()[0]
+        shape_dim: int = src1.type.get_shape()[0]
 
-        # Create arith.constant for n
-        n_const = arith.ConstantOp(IntegerAttr(n_val, IndexType()))
-
-        # Create npu.fvadd
-        fvadd = FVAddOp(src1, src2, dst, n_const.result)
-
-        rewriter.replace_matched_op([n_const, fvadd], [])
+        if shape_dim != DYNAMIC_INDEX:
+            # Static shape: create a constant for n
+            n_const = arith.ConstantOp(IntegerAttr(shape_dim, IndexType()))
+            fvadd = FVAddOp(src1, src2, dst, n_const.result)
+            rewriter.replace_matched_op([n_const, fvadd], [])
+        else:
+            # Dynamic shape (post-tiling): get n from the SubviewOp's size
+            if not isinstance(src1.owner, memref.SubviewOp):
+                return
+            n_ssa = src1.owner.sizes[0]
+            fvadd = FVAddOp(src1, src2, dst, n_ssa)
+            rewriter.replace_matched_op([fvadd], [])
 
 
 @dataclass(frozen=True)

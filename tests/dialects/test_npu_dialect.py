@@ -121,6 +121,35 @@ class TestFVAddOp:
         with pytest.raises(VerifyException, match="expected f32 element type"):
             op.verify()
 
+    def test_verify_n_exceeds_limit_fails(self) -> None:
+        """n > 64 (NPU vector limit) with a known constant triggers verify."""
+        from xdsl.dialects import arith
+        from xdsl.dialects.builtin import IntegerAttr
+
+        memref_type = MemRefType(Float32Type(), [128])
+        src1 = create_ssa_value(memref_type)
+        src2 = create_ssa_value(memref_type)
+        dst = create_ssa_value(memref_type)
+        n_const = arith.ConstantOp(IntegerAttr(128, IndexType()))
+
+        op = FVAddOp(src1, src2, dst, n_const.result)
+        with pytest.raises(VerifyException, match="exceeds NPU vector length limit"):
+            op.verify()
+
+    def test_verify_n_at_limit_ok(self) -> None:
+        """n = 64 (exactly at limit) passes verification."""
+        from xdsl.dialects import arith
+        from xdsl.dialects.builtin import IntegerAttr
+
+        memref_type = MemRefType(Float32Type(), [64])
+        src1 = create_ssa_value(memref_type)
+        src2 = create_ssa_value(memref_type)
+        dst = create_ssa_value(memref_type)
+        n_const = arith.ConstantOp(IntegerAttr(64, IndexType()))
+
+        op = FVAddOp(src1, src2, dst, n_const.result)
+        op.verify()
+
     def test_ir_round_trips(self) -> None:
         """Verify the assembly_format parses back correctly."""
         from xdsl.context import Context
