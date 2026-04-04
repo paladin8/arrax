@@ -127,4 +127,104 @@ class FVSubOp(IRDLOperation):
                     )
 
 
-NPUDialect = Dialect("npu", [FVAddOp, FVSubOp], [])
+@irdl_op_definition
+class FVReluOp(IRDLOperation):
+    """Elementwise vector ReLU: dst[i] = max(src[i], 0.0).
+
+    Maps to NPU.FVRELU (opcode=0x2B, funct7=0x09).
+    """
+
+    name = "npu.fvrelu"
+
+    src = operand_def(MemRefType)
+    dst = operand_def(MemRefType)
+    n = operand_def(IndexType)
+
+    assembly_format = (
+        "$src `,` $dst `,` $n attr-dict"
+        " `:` type($src) `,` type($dst) `,` type($n)"
+    )
+
+    def __init__(
+        self,
+        src: SSAValue | Operation,
+        dst: SSAValue | Operation,
+        n: SSAValue | Operation,
+    ) -> None:
+        super().__init__(operands=[src, dst, n], result_types=[])
+
+    def verify_(self) -> None:
+        src_type = self.src.type
+        dst_type = self.dst.type
+        if src_type != dst_type:
+            raise VerifyException(
+                f"npu.fvrelu: src and dst must have the same type, "
+                f"got {src_type} and {dst_type}"
+            )
+        assert isinstance(src_type, MemRefType)
+        if not isinstance(src_type.element_type, Float32Type):
+            raise VerifyException(
+                f"npu.fvrelu: expected f32 element type, got {src_type.element_type}"
+            )
+        if isinstance(self.n.owner, arith.ConstantOp):
+            n_attr = self.n.owner.value
+            if isinstance(n_attr, IntegerAttr):
+                n_val = n_attr.value.data
+                if n_val > NPU_MAX_VEC_LEN:
+                    raise VerifyException(
+                        f"npu.fvrelu: n={n_val} exceeds NPU vector length "
+                        f"limit ({NPU_MAX_VEC_LEN})"
+                    )
+
+
+@irdl_op_definition
+class FVExpOp(IRDLOperation):
+    """Elementwise vector exponential: dst[i] = exp(src[i]).
+
+    Maps to NPU.FVEXP (opcode=0x2B, funct7=0x02).
+    """
+
+    name = "npu.fvexp"
+
+    src = operand_def(MemRefType)
+    dst = operand_def(MemRefType)
+    n = operand_def(IndexType)
+
+    assembly_format = (
+        "$src `,` $dst `,` $n attr-dict"
+        " `:` type($src) `,` type($dst) `,` type($n)"
+    )
+
+    def __init__(
+        self,
+        src: SSAValue | Operation,
+        dst: SSAValue | Operation,
+        n: SSAValue | Operation,
+    ) -> None:
+        super().__init__(operands=[src, dst, n], result_types=[])
+
+    def verify_(self) -> None:
+        src_type = self.src.type
+        dst_type = self.dst.type
+        if src_type != dst_type:
+            raise VerifyException(
+                f"npu.fvexp: src and dst must have the same type, "
+                f"got {src_type} and {dst_type}"
+            )
+        assert isinstance(src_type, MemRefType)
+        if not isinstance(src_type.element_type, Float32Type):
+            raise VerifyException(
+                f"npu.fvexp: expected f32 element type, got {src_type.element_type}"
+            )
+        if isinstance(self.n.owner, arith.ConstantOp):
+            n_attr = self.n.owner.value
+            if isinstance(n_attr, IntegerAttr):
+                n_val = n_attr.value.data
+                if n_val > NPU_MAX_VEC_LEN:
+                    raise VerifyException(
+                        f"npu.fvexp: n={n_val} exceeds NPU vector length "
+                        f"limit ({NPU_MAX_VEC_LEN})"
+                    )
+
+
+NPUDialect = Dialect("npu", [FVAddOp, FVSubOp, FVReluOp, FVExpOp], [])

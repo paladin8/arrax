@@ -5,15 +5,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from xdsl.context import Context
-from xdsl.dialects import arith, linalg, memref
+from xdsl.dialects import arith, linalg, math, memref
 from xdsl.dialects.builtin import (
     DYNAMIC_INDEX,
+    FloatAttr,
     IndexType,
     IntegerAttr,
     MemRefType,
     ModuleOp,
 )
 from xdsl.dialects.linalg import IteratorType
+from xdsl.ir import SSAValue
 from xdsl.ir.affine import AffineMap
 from xdsl.passes import ModulePass
 from xdsl.pattern_rewriter import (
@@ -24,7 +26,53 @@ from xdsl.pattern_rewriter import (
     op_type_rewrite_pattern,
 )
 
-from arrax.dialects.npu_dialect import FVAddOp, FVSubOp
+from arrax.dialects.npu_dialect import FVAddOp, FVExpOp, FVReluOp, FVSubOp
+
+
+def _extract_n(
+    first_input: SSAValue,
+    rewriter: PatternRewriter,
+) -> tuple[list[arith.ConstantOp], SSAValue] | None:
+    """Extract the element count n from the first input operand.
+
+    Returns (extra_ops, n_ssa) or None if extraction fails.
+    Static shape: creates an arith.constant.
+    Dynamic shape (post-tiling): traces to SubviewOp.sizes[0].
+    """
+    assert isinstance(first_input.type, MemRefType)
+    shape_dim: int = first_input.type.get_shape()[0]
+
+    if shape_dim != DYNAMIC_INDEX:
+        n_const = arith.ConstantOp(IntegerAttr(shape_dim, IndexType()))
+        return [n_const], n_const.result
+    else:
+        if not isinstance(first_input.owner, memref.SubviewOp):
+            return None
+        return [], first_input.owner.sizes[0]
+
+
+def _is_1d_parallel_memref(op: linalg.GenericOp) -> bool:
+    """Check that the generic is 1D, parallel, with identity maps on memrefs."""
+    inputs = list(op.inputs)
+    outputs = list(op.outputs)
+
+    for operand in inputs + outputs:
+        if not isinstance(operand.type, MemRefType):
+            return False
+        if len(operand.type.get_shape()) != 1:
+            return False
+
+    identity_1d = AffineMap.identity(1)
+    for map_attr in op.indexing_maps.data:
+        if map_attr.data != identity_1d:
+            return False
+
+    if len(op.iterator_types.data) != 1:
+        return False
+    if op.iterator_types.data[0].data != IteratorType.PARALLEL:
+        return False
+
+    return True
 
 
 class LinalgElementwiseToNpuPattern(RewritePattern):
@@ -34,41 +82,37 @@ class LinalgElementwiseToNpuPattern(RewritePattern):
     def match_and_rewrite(
         self, op: linalg.GenericOp, rewriter: PatternRewriter
     ) -> None:
-        # Must have 2 inputs, 1 output
+        if not _is_1d_parallel_memref(op):
+            return
+
         inputs = list(op.inputs)
         outputs = list(op.outputs)
-        if len(inputs) != 2 or len(outputs) != 1:
+        if len(outputs) != 1:
             return
 
-        # All operands must be 1D memref (f32 enforced by FVAddOp.verify_())
-        for operand in inputs + outputs:
-            if not isinstance(operand.type, MemRefType):
-                return
-            if len(operand.type.get_shape()) != 1:
-                return
-
-        # Indexing maps must all be 1D identity
-        identity_1d = AffineMap.identity(1)
-        for map_attr in op.indexing_maps.data:
-            if map_attr.data != identity_1d:
-                return
-
-        # Single parallel iterator
-        if len(op.iterator_types.data) != 1:
-            return
-        if op.iterator_types.data[0].data != IteratorType.PARALLEL:
-            return
-
-        # Body must be exactly: one compute op + yield
         body_block = op.body.blocks.first
         assert body_block is not None
         body_ops = list(body_block.ops)
+
+        if len(inputs) == 2:
+            self._match_binary(op, inputs, outputs, body_ops, rewriter)
+        elif len(inputs) == 1:
+            self._match_unary(op, inputs, outputs, body_ops, rewriter)
+
+    def _match_binary(
+        self,
+        op: linalg.GenericOp,
+        inputs: list[SSAValue],
+        outputs: list[SSAValue],
+        body_ops: list,
+        rewriter: PatternRewriter,
+    ) -> None:
+        """Match 2-input generics: addf → FVAdd, subf → FVSub."""
         if len(body_ops) != 2:
             return
         if not isinstance(body_ops[1], linalg.YieldOp):
             return
 
-        # Determine which NPU op to emit based on the body compute op
         compute_op = body_ops[0]
         if isinstance(compute_op, arith.AddfOp):
             npu_op_cls = FVAddOp
@@ -77,23 +121,53 @@ class LinalgElementwiseToNpuPattern(RewritePattern):
         else:
             return
 
-        # Extract n: static shape → constant, dynamic shape → subview size
-        src1 = inputs[0]
-        src2 = inputs[1]
-        dst = outputs[0]
-        assert isinstance(src1.type, MemRefType)
-        shape_dim: int = src1.type.get_shape()[0]
+        result = _extract_n(inputs[0], rewriter)
+        if result is None:
+            return
+        extra_ops, n_ssa = result
 
-        if shape_dim != DYNAMIC_INDEX:
-            n_const = arith.ConstantOp(IntegerAttr(shape_dim, IndexType()))
-            npu_op = npu_op_cls(src1, src2, dst, n_const.result)
-            rewriter.replace_matched_op([n_const, npu_op], [])
-        else:
-            if not isinstance(src1.owner, memref.SubviewOp):
+        npu_op = npu_op_cls(inputs[0], inputs[1], outputs[0], n_ssa)
+        rewriter.replace_matched_op([*extra_ops, npu_op], [])
+
+    def _match_unary(
+        self,
+        op: linalg.GenericOp,
+        inputs: list[SSAValue],
+        outputs: list[SSAValue],
+        body_ops: list,
+        rewriter: PatternRewriter,
+    ) -> None:
+        """Match 1-input generics: maximumf(x,0)→FVRelu, exp→FVExp."""
+        # Relu: constant 0.0, maximumf, yield (3 ops)
+        if len(body_ops) == 3:
+            if (
+                isinstance(body_ops[0], arith.ConstantOp)
+                and isinstance(body_ops[0].value, FloatAttr)
+                and body_ops[0].value.value.data == 0.0
+                and isinstance(body_ops[1], arith.MaximumfOp)
+                and isinstance(body_ops[2], linalg.YieldOp)
+            ):
+                npu_op_cls = FVReluOp
+            else:
                 return
-            n_ssa = src1.owner.sizes[0]
-            npu_op = npu_op_cls(src1, src2, dst, n_ssa)
-            rewriter.replace_matched_op([npu_op], [])
+        # Exp: math.exp, yield (2 ops)
+        elif len(body_ops) == 2:
+            if not isinstance(body_ops[1], linalg.YieldOp):
+                return
+            if isinstance(body_ops[0], math.ExpOp):
+                npu_op_cls = FVExpOp
+            else:
+                return
+        else:
+            return
+
+        result = _extract_n(inputs[0], rewriter)
+        if result is None:
+            return
+        extra_ops, n_ssa = result
+
+        npu_op = npu_op_cls(inputs[0], outputs[0], n_ssa)
+        rewriter.replace_matched_op([*extra_ops, npu_op], [])
 
 
 @dataclass(frozen=True)

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from arrax.dsl.array import Array
+from arrax.dsl.array import Array, exp, relu
 from tests.helpers import lower_to_linalg, make_module
 
 
@@ -85,6 +85,40 @@ builtin.module {
         assert ir.count("linalg.generic") == 2
         assert "arith.addf" in ir
         assert "arith.subf" in ir
+
+    def test_relu(self) -> None:
+        module = make_module(lambda A: relu(A), {"A": (64,)})
+        lower_to_linalg(module)
+        ir = str(module)
+        assert "arith.maximumf" in ir
+        assert "arith.constant 0.0" in ir
+        assert "linalg.generic" in ir
+        assert "array.relu" not in ir
+
+    def test_exp(self) -> None:
+        module = make_module(lambda A: exp(A), {"A": (64,)})
+        lower_to_linalg(module)
+        ir = str(module)
+        assert "math.exp" in ir
+        assert "linalg.generic" in ir
+        assert "array.exp" not in ir
+
+    def test_relu_of_add(self) -> None:
+        """relu(A + B) produces one addf generic and one maximumf generic."""
+        module = make_module(lambda A, B: relu(A + B), {"A": (32,), "B": (32,)})
+        lower_to_linalg(module)
+        ir = str(module)
+        assert ir.count("linalg.generic") == 2
+        assert "arith.addf" in ir
+        assert "arith.maximumf" in ir
+
+    def test_unary_has_one_input(self) -> None:
+        """Unary generic has 1 input and 1 output (2 indexing maps)."""
+        module = make_module(lambda A: relu(A), {"A": (16,)})
+        lower_to_linalg(module)
+        ir = str(module)
+        # 2 affine maps (1 input + 1 output), not 3
+        assert ir.count("affine_map<(d0) -> (d0)>") == 2
 
     def test_2d_tensor(self) -> None:
         """Lowering generalizes to multi-dimensional tensors."""

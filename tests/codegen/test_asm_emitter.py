@@ -15,7 +15,7 @@ from xdsl.ir import Block, Region
 
 from arrax.codegen.asm_emitter import emit_assembly
 from arrax.dialects.npu_dialect import FVAddOp, FVSubOp
-from arrax.dsl.array import Array
+from arrax.dsl.array import Array, exp, relu
 from arrax.lowering.array_to_linalg import ArrayToLinalgPass
 from arrax.lowering.bufferize import BufferizePass
 from arrax.lowering.linalg_to_npu import LinalgToNpuPass
@@ -287,3 +287,35 @@ kernel:
         asm = _to_asm_tiled(module)
         assert ".Lfor_" in asm
         assert ".insn r 0x2B, 0x0, 0x08" in asm
+
+    def test_relu(self) -> None:
+        """relu(A): uses FVRELU funct7=0x09, no copy loop."""
+        module = make_module(lambda A: relu(A), {"A": (64,)})
+        asm = _to_asm(module)
+        assert ".insn r 0x2B, 0x0, 0x09" in asm
+        assert "NPU.FVRELU" in asm
+        # No copy loop for unary ops
+        assert ".Lcopy_" not in asm
+
+    def test_exp(self) -> None:
+        """exp(A): uses FVEXP funct7=0x02, no copy loop."""
+        module = make_module(lambda A: exp(A), {"A": (64,)})
+        asm = _to_asm(module)
+        assert ".insn r 0x2B, 0x0, 0x02" in asm
+        assert "NPU.FVEXP" in asm
+        assert ".Lcopy_" not in asm
+
+    def test_relu_of_add(self) -> None:
+        """relu(A + B): one FVADD with copy + one FVRELU without copy."""
+        module = make_module(lambda A, B: relu(A + B), {"A": (32,), "B": (32,)})
+        asm = _to_asm(module)
+        assert ".insn r 0x2B, 0x0, 0x07" in asm  # FVADD
+        assert ".insn r 0x2B, 0x0, 0x09" in asm  # FVRELU
+        # Only one copy loop (for FVADD), not two
+        assert asm.count("lw t3, 0(t1)") == 1
+
+    def test_tiled_relu(self) -> None:
+        module = make_module(lambda A: relu(A), {"A": (128,)})
+        asm = _to_asm_tiled(module)
+        assert ".Lfor_" in asm
+        assert ".insn r 0x2B, 0x0, 0x09" in asm

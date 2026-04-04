@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from arrax.dsl.array import Array
+from arrax.dsl.array import Array, exp, relu
 
 
 class TestArray:
@@ -77,6 +77,35 @@ class TestArray:
 
         assert result.op == "sub"
         assert result.operands[1] is c
+        inner = result.operands[0]
+        assert inner.op == "add"
+
+    def test_relu_creates_dag_node(self) -> None:
+        a = Array("A", (1024,))
+        r = relu(a)
+
+        assert r.op == "relu"
+        assert not r.is_leaf
+        assert len(r.operands) == 1
+        assert r.operands[0] is a
+        assert r.shape == (1024,)
+
+    def test_exp_creates_dag_node(self) -> None:
+        a = Array("A", (512,))
+        e = exp(a)
+
+        assert e.op == "exp"
+        assert len(e.operands) == 1
+        assert e.operands[0] is a
+        assert e.shape == (512,)
+
+    def test_relu_of_add(self) -> None:
+        """relu(A + B) builds a two-level DAG."""
+        a = Array("A", (100,))
+        b = Array("B", (100,))
+        result = relu(a + b)
+
+        assert result.op == "relu"
         inner = result.operands[0]
         assert inner.op == "add"
 

@@ -31,3 +31,19 @@ class Array:
     @property
     def is_leaf(self) -> bool:
         return self.op is None
+
+
+def relu(x: Array) -> Array:
+    """Elementwise ReLU: max(x, 0)."""
+    result = Array(name="", shape=x.shape)
+    result.op = "relu"
+    result.operands = [x]
+    return result
+
+
+def exp(x: Array) -> Array:
+    """Elementwise exponential."""
+    result = Array(name="", shape=x.shape)
+    result.op = "exp"
+    result.operands = [x]
+    return result

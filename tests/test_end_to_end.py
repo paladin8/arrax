@@ -8,7 +8,7 @@ import numpy as np
 from riscv_npu import Emulator
 
 from arrax.codegen.build import build_elf
-from arrax.dsl.array import Array
+from arrax.dsl.array import Array, exp, relu
 from arrax.pipeline import compile_to_asm
 
 
@@ -193,6 +193,81 @@ class TestEndToEnd:
             tmp_path,
         )
         np.testing.assert_allclose(actual, expected, rtol=1e-6)
+
+    def test_relu(self, tmp_path: Path) -> None:
+        """relu(A): clamps negative values to zero."""
+        N = 128
+        A = np.linspace(-5.0, 5.0, N, dtype=np.float32)
+        expected = np.maximum(A, 0.0)
+
+        actual, _ = _compile_and_run(
+            lambda A: relu(A),
+            {"A": (N,)},
+            {"A": A},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-6)
+
+    def test_relu_all_positive(self, tmp_path: Path) -> None:
+        """relu on all-positive input is identity."""
+        N = 64
+        A = np.arange(1, N + 1, dtype=np.float32)
+        expected = A.copy()
+
+        actual, _ = _compile_and_run(
+            lambda A: relu(A),
+            {"A": (N,)},
+            {"A": A},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-6)
+
+    def test_exp(self, tmp_path: Path) -> None:
+        """exp(A): elementwise exponential."""
+        N = 64
+        A = np.linspace(-2.0, 2.0, N, dtype=np.float32)
+        expected = np.exp(A)
+
+        actual, _ = _compile_and_run(
+            lambda A: exp(A),
+            {"A": (N,)},
+            {"A": A},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-5)
+
+    def test_relu_of_add(self, tmp_path: Path) -> None:
+        """relu(A + B): chained binary + unary."""
+        N = 100
+
+        def kernel(A: Array, B: Array) -> Array:
+            return relu(A + B)
+
+        A = np.linspace(-10.0, 10.0, N, dtype=np.float32)
+        B = np.ones(N, dtype=np.float32) * (-3.0)
+        expected = np.maximum(A + B, 0.0)
+
+        actual, _ = _compile_and_run(
+            kernel,
+            {"A": (N,), "B": (N,)},
+            {"A": A, "B": B},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-6)
+
+    def test_exp_large(self, tmp_path: Path) -> None:
+        """exp(A) with N=256: exercises tiling."""
+        N = 256
+        A = np.linspace(-1.0, 1.0, N, dtype=np.float32)
+        expected = np.exp(A)
+
+        actual, _ = _compile_and_run(
+            lambda A: exp(A),
+            {"A": (N,)},
+            {"A": A},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-5)
 
     def test_reports_cycles(self, tmp_path: Path) -> None:
         """Emulator reports nonzero cycle count."""

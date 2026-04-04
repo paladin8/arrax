@@ -5,10 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from xdsl.context import Context
-from xdsl.dialects import arith, linalg, tensor
+from xdsl.dialects import arith, linalg, math, tensor
 from xdsl.dialects.builtin import (
     AffineMapAttr,
     Float32Type,
+    FloatAttr,
     ModuleOp,
     TensorType,
 )
@@ -24,7 +25,7 @@ from xdsl.pattern_rewriter import (
     op_type_rewrite_pattern,
 )
 
-from arrax.dialects.array_dialect import AddOp, SubOp
+from arrax.dialects.array_dialect import AddOp, ExpOp, ReluOp, SubOp
 
 
 class AddToLinalgPattern(RewritePattern):
@@ -98,6 +99,77 @@ class SubToLinalgPattern(RewritePattern):
         rewriter.replace_matched_op([empty, generic], [generic.res[0]])
 
 
+class ReluToLinalgPattern(RewritePattern):
+    """Rewrite array.relu to linalg.generic with arith.maximumf(x, 0.0) body."""
+
+    @op_type_rewrite_pattern
+    def match_and_rewrite(self, op: ReluOp, rewriter: PatternRewriter) -> None:
+        result_type = op.result.type
+        assert isinstance(result_type, TensorType)
+        f32 = Float32Type()
+
+        empty = tensor.EmptyOp([], result_type)
+
+        ndims = len(result_type.get_shape())
+        identity = AffineMap.identity(ndims)
+        maps = [AffineMapAttr(identity)] * 2  # ins0, outs0
+        iters = [IteratorTypeAttr.parallel() for _ in range(ndims)]
+
+        # Body: constant 0.0, maximumf(in, 0.0), yield
+        scalar_types = [f32] * 2  # (in, out)
+        block = Block(arg_types=scalar_types)
+        zero = arith.ConstantOp(FloatAttr(0.0, f32))
+        maximum = arith.MaximumfOp(block.args[0], zero.result)
+        yield_op = linalg.YieldOp(maximum.result)
+        block.add_ops([zero, maximum, yield_op])
+        body = Region([block])
+
+        generic = linalg.GenericOp(
+            inputs=[op.input],
+            outputs=[empty.tensor],
+            body=body,
+            indexing_maps=maps,
+            iterator_types=iters,
+            result_types=[result_type],
+        )
+        rewriter.replace_matched_op([empty, generic], [generic.res[0]])
+
+
+class ExpToLinalgPattern(RewritePattern):
+    """Rewrite array.exp to linalg.generic with math.exp body."""
+
+    @op_type_rewrite_pattern
+    def match_and_rewrite(self, op: ExpOp, rewriter: PatternRewriter) -> None:
+        result_type = op.result.type
+        assert isinstance(result_type, TensorType)
+        f32 = Float32Type()
+
+        empty = tensor.EmptyOp([], result_type)
+
+        ndims = len(result_type.get_shape())
+        identity = AffineMap.identity(ndims)
+        maps = [AffineMapAttr(identity)] * 2  # ins0, outs0
+        iters = [IteratorTypeAttr.parallel() for _ in range(ndims)]
+
+        # Body: math.exp(in), yield
+        scalar_types = [f32] * 2  # (in, out)
+        block = Block(arg_types=scalar_types)
+        exp_op = math.ExpOp(block.args[0])
+        yield_op = linalg.YieldOp(exp_op.result)
+        block.add_ops([exp_op, yield_op])
+        body = Region([block])
+
+        generic = linalg.GenericOp(
+            inputs=[op.input],
+            outputs=[empty.tensor],
+            body=body,
+            indexing_maps=maps,
+            iterator_types=iters,
+            result_types=[result_type],
+        )
+        rewriter.replace_matched_op([empty, generic], [generic.res[0]])
+
+
 @dataclass(frozen=True)
 class ArrayToLinalgPass(ModulePass):
     """Lower array dialect ops to linalg.generic on tensors."""
@@ -106,7 +178,10 @@ class ArrayToLinalgPass(ModulePass):
 
     def apply(self, ctx: Context, op: ModuleOp) -> None:
         PatternRewriteWalker(
-            GreedyRewritePatternApplier(
-                [AddToLinalgPattern(), SubToLinalgPattern()]
-            )
+            GreedyRewritePatternApplier([
+                AddToLinalgPattern(),
+                SubToLinalgPattern(),
+                ReluToLinalgPattern(),
+                ExpToLinalgPattern(),
+            ])
         ).rewrite_module(op)

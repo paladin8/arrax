@@ -8,7 +8,7 @@ from xdsl.dialects.builtin import Float32Type, ModuleOp, TensorType
 from xdsl.utils.exceptions import VerifyException
 from xdsl.utils.test_value import create_ssa_value
 
-from arrax.dialects.array_dialect import AddOp, ArrayDialect, SubOp
+from arrax.dialects.array_dialect import AddOp, ArrayDialect, ExpOp, ReluOp, SubOp
 
 
 class TestArrayDialect:
@@ -20,6 +20,12 @@ class TestArrayDialect:
 
     def test_dialect_contains_sub(self) -> None:
         assert SubOp in ArrayDialect._operations
+
+    def test_dialect_contains_relu(self) -> None:
+        assert ReluOp in ArrayDialect._operations
+
+    def test_dialect_contains_exp(self) -> None:
+        assert ExpOp in ArrayDialect._operations
 
 
 class TestAddOp:
@@ -156,3 +162,53 @@ class TestSubOp:
         ir_text = str(module)
         assert "array.sub" in ir_text
         assert "tensor<1024xf32>, tensor<1024xf32> -> tensor<1024xf32>" in ir_text
+
+
+class TestReluOp:
+    def test_construction(self) -> None:
+        tensor_type = TensorType(Float32Type(), [1024])
+        input_val = create_ssa_value(tensor_type)
+        op = ReluOp(input_val)
+
+        assert op.input == input_val
+        assert op.result.type == tensor_type
+
+    def test_verify(self) -> None:
+        tensor_type = TensorType(Float32Type(), [64])
+        input_val = create_ssa_value(tensor_type)
+        op = ReluOp(input_val)
+        op.verify()
+
+    def test_ir_prints_correctly(self) -> None:
+        tensor_type = TensorType(Float32Type(), [1024])
+        input_val = create_ssa_value(tensor_type)
+        op = ReluOp(input_val)
+        module = ModuleOp([input_val.owner, op])
+
+        ir_text = str(module)
+        assert "array.relu" in ir_text
+
+
+class TestExpOp:
+    def test_construction(self) -> None:
+        tensor_type = TensorType(Float32Type(), [1024])
+        input_val = create_ssa_value(tensor_type)
+        op = ExpOp(input_val)
+
+        assert op.input == input_val
+        assert op.result.type == tensor_type
+
+    def test_verify(self) -> None:
+        tensor_type = TensorType(Float32Type(), [64])
+        input_val = create_ssa_value(tensor_type)
+        op = ExpOp(input_val)
+        op.verify()
+
+    def test_ir_prints_correctly(self) -> None:
+        tensor_type = TensorType(Float32Type(), [1024])
+        input_val = create_ssa_value(tensor_type)
+        op = ExpOp(input_val)
+        module = ModuleOp([input_val.owner, op])
+
+        ir_text = str(module)
+        assert "array.exp" in ir_text

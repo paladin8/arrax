@@ -9,7 +9,7 @@ from xdsl.dialects.builtin import Float32Type, Float64Type, IndexType, IntegerAt
 from xdsl.utils.exceptions import VerifyException
 from xdsl.utils.test_value import create_ssa_value
 
-from arrax.dialects.npu_dialect import FVAddOp, FVSubOp, NPUDialect
+from arrax.dialects.npu_dialect import FVAddOp, FVExpOp, FVReluOp, FVSubOp, NPUDialect
 
 
 class TestNPUDialect:
@@ -21,6 +21,12 @@ class TestNPUDialect:
 
     def test_dialect_contains_fvsub(self) -> None:
         assert FVSubOp in NPUDialect._operations
+
+    def test_dialect_contains_fvrelu(self) -> None:
+        assert FVReluOp in NPUDialect._operations
+
+    def test_dialect_contains_fvexp(self) -> None:
+        assert FVExpOp in NPUDialect._operations
 
 
 class TestFVAddOp:
@@ -245,3 +251,94 @@ class TestFVSubOp:
         ir = str(module)
         assert "npu.fvsub" in ir
         assert "memref<1024xf32>" in ir
+
+
+class TestFVReluOp:
+    def test_construction(self) -> None:
+        memref_type = MemRefType(Float32Type(), [1024])
+        src = create_ssa_value(memref_type)
+        dst = create_ssa_value(memref_type)
+        n = create_ssa_value(IndexType())
+
+        op = FVReluOp(src, dst, n)
+        assert op.src == src
+        assert op.dst == dst
+        assert op.n == n
+        assert len(op.results) == 0
+
+    def test_verify(self) -> None:
+        memref_type = MemRefType(Float32Type(), [64])
+        src = create_ssa_value(memref_type)
+        dst = create_ssa_value(memref_type)
+        n = create_ssa_value(IndexType())
+
+        op = FVReluOp(src, dst, n)
+        op.verify()
+
+    def test_verify_mismatched_types_fails(self) -> None:
+        type_a = MemRefType(Float32Type(), [1024])
+        type_b = MemRefType(Float32Type(), [512])
+        src = create_ssa_value(type_a)
+        dst = create_ssa_value(type_b)
+        n = create_ssa_value(IndexType())
+
+        op = FVReluOp(src, dst, n)
+        with pytest.raises(VerifyException, match="src and dst must have the same type"):
+            op.verify()
+
+    def test_verify_n_exceeds_limit_fails(self) -> None:
+        memref_type = MemRefType(Float32Type(), [128])
+        src = create_ssa_value(memref_type)
+        dst = create_ssa_value(memref_type)
+        n_const = arith.ConstantOp(IntegerAttr(128, IndexType()))
+
+        op = FVReluOp(src, dst, n_const.result)
+        with pytest.raises(VerifyException, match="exceeds NPU vector length limit"):
+            op.verify()
+
+    def test_ir_prints_correctly(self) -> None:
+        memref_type = MemRefType(Float32Type(), [1024])
+        src = create_ssa_value(memref_type)
+        dst = create_ssa_value(memref_type)
+        n = create_ssa_value(IndexType())
+
+        op = FVReluOp(src, dst, n)
+        module = ModuleOp([src.owner, dst.owner, n.owner, op])
+
+        ir = str(module)
+        assert "npu.fvrelu" in ir
+
+
+class TestFVExpOp:
+    def test_construction(self) -> None:
+        memref_type = MemRefType(Float32Type(), [1024])
+        src = create_ssa_value(memref_type)
+        dst = create_ssa_value(memref_type)
+        n = create_ssa_value(IndexType())
+
+        op = FVExpOp(src, dst, n)
+        assert op.src == src
+        assert op.dst == dst
+        assert op.n == n
+        assert len(op.results) == 0
+
+    def test_verify(self) -> None:
+        memref_type = MemRefType(Float32Type(), [64])
+        src = create_ssa_value(memref_type)
+        dst = create_ssa_value(memref_type)
+        n = create_ssa_value(IndexType())
+
+        op = FVExpOp(src, dst, n)
+        op.verify()
+
+    def test_ir_prints_correctly(self) -> None:
+        memref_type = MemRefType(Float32Type(), [1024])
+        src = create_ssa_value(memref_type)
+        dst = create_ssa_value(memref_type)
+        n = create_ssa_value(IndexType())
+
+        op = FVExpOp(src, dst, n)
+        module = ModuleOp([src.owner, dst.owner, n.owner, op])
+
+        ir = str(module)
+        assert "npu.fvexp" in ir

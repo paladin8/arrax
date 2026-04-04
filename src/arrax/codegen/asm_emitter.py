@@ -22,7 +22,7 @@ from xdsl.dialects import arith, func, memref, scf
 from xdsl.dialects.builtin import IntegerAttr, MemRefType, ModuleOp
 from xdsl.ir import Block, Operation, SSAValue
 
-from arrax.dialects.npu_dialect import FVAddOp, FVSubOp
+from arrax.dialects.npu_dialect import FVAddOp, FVExpOp, FVReluOp, FVSubOp
 
 # t-registers for loop-body-local values that die before the copy loop.
 # t0-t3 are reserved as scratch for copy loops and constant loading.
@@ -172,6 +172,10 @@ class _AsmEmitter:
             self._emit_fv_binop(op, "FVADD", 0x07)
         elif isinstance(op, FVSubOp):
             self._emit_fv_binop(op, "FVSUB", 0x08)
+        elif isinstance(op, FVReluOp):
+            self._emit_fv_unop(op, "FVRELU", 0x09)
+        elif isinstance(op, FVExpOp):
+            self._emit_fv_unop(op, "FVEXP", 0x02)
         elif isinstance(op, scf.ForOp):
             self._emit_for(op)
         elif isinstance(op, memref.SubviewOp):
@@ -302,6 +306,30 @@ class _AsmEmitter:
         self._lines.append(f"    mv {result_reg}, {rhs_reg}")
         self._lines.append(f"{done_label}:")
         self._reg_map[id(op.result)] = result_reg
+
+    def _emit_fv_unop(
+        self, op: FVReluOp | FVExpOp, name: str, funct7: int
+    ) -> None:
+        """Emit .insn for a unary NPU op (no copy loop needed).
+
+        Hardware reads from rs1 and writes to rs2 independently.
+        """
+        src = self._reg(op.src)
+        dst = self._reg(op.dst)
+        n_is_const = id(op.n) in self._const_map
+        funct7_hex = f"0x{funct7:02X}"
+
+        self._lines.append(f"    # NPU.{name} {dst}[i] = {name.lower()}({src}[i])")
+        if n_is_const:
+            self._lines.append(f"    li t0, {self._const(op.n)}")
+            self._lines.append(
+                f"    .insn r 0x2B, 0x0, {funct7_hex}, t0, {src}, {dst}"
+            )
+        else:
+            n_reg = self._reg(op.n)
+            self._lines.append(
+                f"    .insn r 0x2B, 0x0, {funct7_hex}, {n_reg}, {src}, {dst}"
+            )
 
     def _emit_fv_binop(
         self, op: FVAddOp | FVSubOp, name: str, funct7: int

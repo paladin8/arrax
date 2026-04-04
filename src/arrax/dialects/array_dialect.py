@@ -81,4 +81,40 @@ class SubOp(IRDLOperation):
             )
 
 
-ArrayDialect = Dialect("array", [AddOp, SubOp], [])
+@irdl_op_definition
+class ReluOp(IRDLOperation):
+    """Elementwise ReLU: max(input, 0)."""
+
+    name = "array.relu"
+
+    input = operand_def(TensorType)
+    result = result_def(TensorType)
+
+    assembly_format = "$input attr-dict `:` type($input) `->` type($result)"
+
+    traits = traits_def(Pure())
+
+    def __init__(self, input: SSAValue | Operation) -> None:
+        input_val = SSAValue.get(input)
+        super().__init__(operands=[input], result_types=[input_val.type])
+
+
+@irdl_op_definition
+class ExpOp(IRDLOperation):
+    """Elementwise exponential."""
+
+    name = "array.exp"
+
+    input = operand_def(TensorType)
+    result = result_def(TensorType)
+
+    assembly_format = "$input attr-dict `:` type($input) `->` type($result)"
+
+    traits = traits_def(Pure())
+
+    def __init__(self, input: SSAValue | Operation) -> None:
+        input_val = SSAValue.get(input)
+        super().__init__(operands=[input], result_types=[input_val.type])
+
+
+ArrayDialect = Dialect("array", [AddOp, SubOp, ReluOp, ExpOp], [])

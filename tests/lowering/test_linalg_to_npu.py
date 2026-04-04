@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from xdsl.context import Context
-
-from arrax.dsl.array import Array
 from xdsl.dialects.builtin import ModuleOp
+
+from arrax.dsl.array import Array, exp, relu
 
 from arrax.lowering.array_to_linalg import ArrayToLinalgPass
 from arrax.lowering.bufferize import BufferizePass
@@ -198,6 +198,43 @@ builtin.module {
         _lower_to_npu_with_tiling(module)
         ir = str(module)
         assert "npu.fvsub" in ir
+        assert "scf.for" in ir
+
+    def test_relu(self) -> None:
+        module = make_module(lambda A: relu(A), {"A": (64,)})
+        _lower_to_npu(module)
+        ir = str(module)
+        assert "npu.fvrelu" in ir
+        assert "linalg.generic" not in ir
+
+    def test_exp(self) -> None:
+        module = make_module(lambda A: exp(A), {"A": (64,)})
+        _lower_to_npu(module)
+        ir = str(module)
+        assert "npu.fvexp" in ir
+        assert "linalg.generic" not in ir
+
+    def test_relu_of_add(self) -> None:
+        """relu(A + B) produces one fvadd and one fvrelu."""
+        module = make_module(lambda A, B: relu(A + B), {"A": (32,), "B": (32,)})
+        _lower_to_npu(module)
+        ir = str(module)
+        assert "npu.fvadd" in ir
+        assert "npu.fvrelu" in ir
+        assert "linalg.generic" not in ir
+
+    def test_tiled_relu(self) -> None:
+        module = make_module(lambda A: relu(A), {"A": (128,)})
+        _lower_to_npu_with_tiling(module)
+        ir = str(module)
+        assert "npu.fvrelu" in ir
+        assert "scf.for" in ir
+
+    def test_tiled_exp(self) -> None:
+        module = make_module(lambda A: exp(A), {"A": (128,)})
+        _lower_to_npu_with_tiling(module)
+        ir = str(module)
+        assert "npu.fvexp" in ir
         assert "scf.for" in ir
 
     def test_tiled_no_arith_constant_for_n(self) -> None:
