@@ -12,6 +12,7 @@ from arrax.dsl.tracer import trace
 from arrax.lowering.array_to_linalg import ArrayToLinalgPass
 from arrax.lowering.bufferize import BufferizePass
 from arrax.lowering.dsl_to_array import dsl_to_array
+from arrax.lowering.fusion import FusionPass
 from arrax.lowering.tile import TilePass
 
 
@@ -46,5 +47,16 @@ def tile(module: ModuleOp) -> ModuleOp:
     ArrayToLinalgPass().apply(ctx, module)
     BufferizePass().apply(ctx, module)
     TilePass().apply(ctx, module)
+    module.verify()
+    return module
+
+
+def fuse(module: ModuleOp) -> ModuleOp:
+    """Apply array-to-linalg, bufferize, tile, then fuse in place."""
+    ctx = Context()
+    ArrayToLinalgPass().apply(ctx, module)
+    BufferizePass().apply(ctx, module)
+    TilePass().apply(ctx, module)
+    FusionPass().apply(ctx, module)
     module.verify()
     return module

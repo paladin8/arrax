@@ -269,6 +269,42 @@ class TestEndToEnd:
         )
         np.testing.assert_allclose(actual, expected, rtol=1e-5)
 
+    def test_relu_sub_chain(self, tmp_path: Path) -> None:
+        """relu(A + B) - C: 3-way fusion exercised end-to-end."""
+        N = 128
+
+        def kernel(A: Array, B: Array, C: Array) -> Array:
+            return relu(A + B) - C
+
+        A = np.linspace(-10.0, 10.0, N, dtype=np.float32)
+        B = np.ones(N, dtype=np.float32) * 2.0
+        C = np.ones(N, dtype=np.float32) * 1.0
+        expected = np.maximum(A + B, 0.0) - C
+
+        actual, _ = _compile_and_run(
+            kernel,
+            {"A": (N,), "B": (N,), "C": (N,)},
+            {"A": A, "B": B, "C": C},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-6)
+
+    def test_exp_of_sub(self, tmp_path: Path) -> None:
+        """exp(A - B): 2-way fusion."""
+        N = 64
+
+        actual, _ = _compile_and_run(
+            lambda A, B: exp(A - B),
+            {"A": (N,), "B": (N,)},
+            {
+                "A": np.ones(N, dtype=np.float32),
+                "B": np.ones(N, dtype=np.float32) * 0.5,
+            },
+            tmp_path,
+        )
+        expected = np.exp(np.ones(N, dtype=np.float32) * 0.5)
+        np.testing.assert_allclose(actual, expected, rtol=1e-5)
+
     def test_reports_cycles(self, tmp_path: Path) -> None:
         """Emulator reports nonzero cycle count."""
         N = 16
