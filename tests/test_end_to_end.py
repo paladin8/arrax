@@ -305,6 +305,27 @@ class TestEndToEnd:
         expected = np.exp(np.ones(N, dtype=np.float32) * 0.5)
         np.testing.assert_allclose(actual, expected, rtol=1e-5)
 
+    def test_relu_add_relu_sub(self, tmp_path: Path) -> None:
+        """relu(A+B) + relu(C-D): 4 intermediates, buffer reuse exercised."""
+        N = 128
+
+        def kernel(A: Array, B: Array, C: Array, D: Array) -> Array:
+            return relu(A + B) + relu(C - D)
+
+        A = np.linspace(-5.0, 5.0, N, dtype=np.float32)
+        B = np.ones(N, dtype=np.float32) * 2.0
+        C = np.ones(N, dtype=np.float32) * 10.0
+        D = np.linspace(0.0, 20.0, N, dtype=np.float32)
+        expected = np.maximum(A + B, 0.0) + np.maximum(C - D, 0.0)
+
+        actual, _ = _compile_and_run(
+            kernel,
+            {"A": (N,), "B": (N,), "C": (N,), "D": (N,)},
+            {"A": A, "B": B, "C": C, "D": D},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-6)
+
     def test_reports_cycles(self, tmp_path: Path) -> None:
         """Emulator reports nonzero cycle count."""
         N = 16

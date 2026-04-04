@@ -10,6 +10,7 @@ from xdsl.dialects.builtin import ModuleOp
 from arrax.dsl.array import Array
 from arrax.dsl.tracer import trace
 from arrax.lowering.array_to_linalg import ArrayToLinalgPass
+from arrax.lowering.buffer_optimize import BufferOptimizePass
 from arrax.lowering.bufferize import BufferizePass
 from arrax.lowering.dsl_to_array import dsl_to_array
 from arrax.lowering.fusion import FusionPass
@@ -58,5 +59,17 @@ def fuse(module: ModuleOp) -> ModuleOp:
     BufferizePass().apply(ctx, module)
     TilePass().apply(ctx, module)
     FusionPass().apply(ctx, module)
+    module.verify()
+    return module
+
+
+def optimize_buffers(module: ModuleOp) -> ModuleOp:
+    """Apply full pipeline through buffer optimization."""
+    ctx = Context()
+    ArrayToLinalgPass().apply(ctx, module)
+    BufferizePass().apply(ctx, module)
+    TilePass().apply(ctx, module)
+    FusionPass().apply(ctx, module)
+    BufferOptimizePass().apply(ctx, module)
     module.verify()
     return module
