@@ -281,6 +281,32 @@ kernel:
         assert ".insn r 0x2B, 0x0, 0x07" in asm  # FVADD
         assert ".insn r 0x2B, 0x0, 0x08" in asm  # FVSUB
 
+    def test_mul_scalar(self) -> None:
+        """A * 3.0: facc load + FVMUL."""
+        module = make_module(lambda A: A * 3.0, {"A": (64,)})
+        asm = _to_asm(module)
+        # FRSTACC to zero facc
+        assert ".insn r 0x2B, 0x5, 0x00" in asm
+        # FMACC to load scalar
+        assert ".insn r 0x2B, 0x0, 0x00" in asm
+        # FVMUL
+        assert ".insn r 0x2B, 0x0, 0x04" in asm
+        assert "NPU.FVMUL" in asm
+
+    def test_div_scalar(self) -> None:
+        """A / 2.0: facc load + FVDIV."""
+        module = make_module(lambda A: A / 2.0, {"A": (64,)})
+        asm = _to_asm(module)
+        assert ".insn r 0x2B, 0x0, 0x0B" in asm
+        assert "NPU.FVDIV" in asm
+
+    def test_tiled_mul_scalar(self) -> None:
+        """Tiled A * 3.0: facc load inside loop + FVMUL."""
+        module = make_module(lambda A: A * 3.0, {"A": (128,)})
+        asm = _to_asm_tiled(module)
+        assert ".Lfor_" in asm
+        assert ".insn r 0x2B, 0x0, 0x04" in asm
+
     def test_tiled_sub(self) -> None:
         """Tiled subtraction produces loop with FVSUB."""
         module = make_module(lambda A, B: A - B, {"A": (128,), "B": (128,)})

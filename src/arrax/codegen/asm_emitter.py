@@ -18,11 +18,20 @@ Register allocation strategy:
 
 from __future__ import annotations
 
+import struct
+
 from xdsl.dialects import arith, func, memref, scf
 from xdsl.dialects.builtin import IntegerAttr, MemRefType, ModuleOp
 from xdsl.ir import Block, Operation, SSAValue
 
-from arrax.dialects.npu_dialect import FVAddOp, FVExpOp, FVReluOp, FVSubOp
+from arrax.dialects.npu_dialect import (
+    FVAddOp,
+    FVDivOp,
+    FVExpOp,
+    FVMulOp,
+    FVReluOp,
+    FVSubOp,
+)
 
 # t-registers for loop-body-local values that die before the copy loop.
 # t0-t3 are reserved as scratch for copy loops and constant loading.
@@ -176,6 +185,10 @@ class _AsmEmitter:
             self._emit_fv_unop(op, "FVRELU", 0x09)
         elif isinstance(op, FVExpOp):
             self._emit_fv_unop(op, "FVEXP", 0x02)
+        elif isinstance(op, FVMulOp):
+            self._emit_fv_scalar_op(op, "FVMUL", 0x04)
+        elif isinstance(op, FVDivOp):
+            self._emit_fv_scalar_op(op, "FVDIV", 0x0B)
         elif isinstance(op, scf.ForOp):
             self._emit_for(op)
         elif isinstance(op, memref.SubviewOp):
@@ -320,6 +333,61 @@ class _AsmEmitter:
         funct7_hex = f"0x{funct7:02X}"
 
         self._lines.append(f"    # NPU.{name} {dst}[i] = {name.lower()}({src}[i])")
+        if n_is_const:
+            self._lines.append(f"    li t0, {self._const(op.n)}")
+            self._lines.append(
+                f"    .insn r 0x2B, 0x0, {funct7_hex}, t0, {src}, {dst}"
+            )
+        else:
+            n_reg = self._reg(op.n)
+            self._lines.append(
+                f"    .insn r 0x2B, 0x0, {funct7_hex}, {n_reg}, {src}, {dst}"
+            )
+
+    def _emit_facc_load(self, scalar_bits: int) -> None:
+        """Emit the instruction sequence to load a float32 scalar into facc.
+
+        Sequence: FRSTACC (zero facc), load scalar bits into f1,
+        load 1.0 into f2, FMACC (facc = f1 * f2 = scalar).
+        """
+        self._lines.append(f"    # Load scalar into facc")
+        # FRSTACC: f[rd] = facc; facc = 0.0
+        self._lines.append(f"    .insn r 0x2B, 0x5, 0x00, f0, f0, f0")
+        # Load scalar float bits into f1
+        self._lines.append(f"    li t0, {scalar_bits}")
+        self._lines.append(f"    fmv.w.x f1, t0")
+        # Load 1.0f into f2
+        self._lines.append(f"    lui t0, 0x3F800")
+        self._lines.append(f"    fmv.w.x f2, t0")
+        # FMACC: facc += f1 * f2 = scalar * 1.0
+        self._lines.append(f"    .insn r 0x2B, 0x0, 0x00, f0, f1, f2")
+
+    def _emit_fv_scalar_op(
+        self, op: FVMulOp | FVDivOp, name: str, funct7: int
+    ) -> None:
+        """Emit facc load + .insn for a scalar-vector NPU op.
+
+        NOTE: facc load is emitted inline with each scalar op. In a tiled
+        loop, this reloads facc each iteration. A future optimization could
+        hoist the load before the loop since facc persists across iterations.
+        """
+        src = self._reg(op.src)
+        dst = self._reg(op.dst)
+        n_is_const = id(op.n) in self._const_map
+        funct7_hex = f"0x{funct7:02X}"
+        op_symbol = "*" if isinstance(op, FVMulOp) else "/"
+
+        # Convert float scalar to IEEE 754 bits
+        scalar_val = op.scalar.value.data
+        scalar_bits = struct.unpack("<I", struct.pack("<f", scalar_val))[0]
+
+        # Load scalar into facc
+        self._emit_facc_load(scalar_bits)
+
+        # NPU instruction: rd=n, rs1=src, rs2=dst
+        self._lines.append(
+            f"    # NPU.{name} {dst}[i] = {src}[i] {op_symbol} {scalar_val}"
+        )
         if n_is_const:
             self._lines.append(f"    li t0, {self._const(op.n)}")
             self._lines.append(

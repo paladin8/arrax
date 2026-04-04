@@ -26,7 +26,14 @@ from xdsl.pattern_rewriter import (
     op_type_rewrite_pattern,
 )
 
-from arrax.dialects.npu_dialect import FVAddOp, FVExpOp, FVReluOp, FVSubOp
+from arrax.dialects.npu_dialect import (
+    FVAddOp,
+    FVDivOp,
+    FVExpOp,
+    FVMulOp,
+    FVReluOp,
+    FVSubOp,
+)
 
 
 def _extract_n(
@@ -137,25 +144,41 @@ class LinalgElementwiseToNpuPattern(RewritePattern):
         body_ops: list,
         rewriter: PatternRewriter,
     ) -> None:
-        """Match 1-input generics: maximumf(x,0)→FVRelu, exp→FVExp."""
-        # Relu: constant 0.0, maximumf, yield (3 ops)
+        """Match 1-input generics to NPU ops.
+
+        Patterns:
+        - [constant 0.0, maximumf, yield] → FVRelu
+        - [constant, mulf, yield]         → FVMul (scalar-vector)
+        - [constant, divf, yield]         → FVDiv (scalar-vector)
+        - [math.exp, yield]               → FVExp
+        """
+        scalar_val: float | None = None
+
         if len(body_ops) == 3:
-            if (
-                isinstance(body_ops[0], arith.ConstantOp)
-                and isinstance(body_ops[0].value, FloatAttr)
-                and body_ops[0].value.value.data == 0.0
-                and isinstance(body_ops[1], arith.MaximumfOp)
-                and isinstance(body_ops[2], linalg.YieldOp)
-            ):
-                npu_op_cls = FVReluOp
+            if not isinstance(body_ops[0], arith.ConstantOp):
+                return
+            if not isinstance(body_ops[0].value, FloatAttr):
+                return
+            if not isinstance(body_ops[2], linalg.YieldOp):
+                return
+            const_val = body_ops[0].value.value.data
+            compute = body_ops[1]
+
+            if isinstance(compute, arith.MaximumfOp) and const_val == 0.0:
+                npu_op_type = "relu"
+            elif isinstance(compute, arith.MulfOp):
+                npu_op_type = "mul_scalar"
+                scalar_val = const_val
+            elif isinstance(compute, arith.DivfOp):
+                npu_op_type = "div_scalar"
+                scalar_val = const_val
             else:
                 return
-        # Exp: math.exp, yield (2 ops)
         elif len(body_ops) == 2:
             if not isinstance(body_ops[1], linalg.YieldOp):
                 return
             if isinstance(body_ops[0], math.ExpOp):
-                npu_op_cls = FVExpOp
+                npu_op_type = "exp"
             else:
                 return
         else:
@@ -166,7 +189,19 @@ class LinalgElementwiseToNpuPattern(RewritePattern):
             return
         extra_ops, n_ssa = result
 
-        npu_op = npu_op_cls(inputs[0], outputs[0], n_ssa)
+        if npu_op_type == "relu":
+            npu_op = FVReluOp(inputs[0], outputs[0], n_ssa)
+        elif npu_op_type == "exp":
+            npu_op = FVExpOp(inputs[0], outputs[0], n_ssa)
+        elif npu_op_type == "mul_scalar":
+            assert scalar_val is not None
+            npu_op = FVMulOp(inputs[0], outputs[0], n_ssa, scalar_val)
+        elif npu_op_type == "div_scalar":
+            assert scalar_val is not None
+            npu_op = FVDivOp(inputs[0], outputs[0], n_ssa, scalar_val)
+        else:
+            return
+
         rewriter.replace_matched_op([*extra_ops, npu_op], [])
 
 

@@ -8,12 +8,14 @@ the hardware's in-place semantics (copy + insn when dst != src2).
 from __future__ import annotations
 
 from xdsl.dialects import arith
-from xdsl.dialects.builtin import Float32Type, IndexType, IntegerAttr, MemRefType
+from xdsl.dialects.builtin import Float32Type, FloatAttr, IndexType, IntegerAttr, MemRefType
 from xdsl.ir import Dialect, Operation, SSAValue
 from xdsl.irdl import (
     IRDLOperation,
+    ParsePropInAttrDict,
     irdl_op_definition,
     operand_def,
+    prop_def,
 )
 from xdsl.utils.exceptions import VerifyException
 
@@ -227,4 +229,124 @@ class FVExpOp(IRDLOperation):
                     )
 
 
-NPUDialect = Dialect("npu", [FVAddOp, FVSubOp, FVReluOp, FVExpOp], [])
+@irdl_op_definition
+class FVMulOp(IRDLOperation):
+    """Vector multiply by scalar: dst[i] = src[i] * scalar.
+
+    Maps to NPU.FVMUL (opcode=0x2B, funct7=0x04).
+    The scalar is loaded into facc before execution.
+    """
+
+    name = "npu.fvmul"
+
+    src = operand_def(MemRefType)
+    dst = operand_def(MemRefType)
+    n = operand_def(IndexType)
+    scalar = prop_def(FloatAttr)
+
+    irdl_options = (ParsePropInAttrDict(),)
+
+    assembly_format = (
+        "$src `,` $dst `,` $n attr-dict"
+        " `:` type($src) `,` type($dst) `,` type($n)"
+    )
+
+    def __init__(
+        self,
+        src: SSAValue | Operation,
+        dst: SSAValue | Operation,
+        n: SSAValue | Operation,
+        scalar: float,
+    ) -> None:
+        super().__init__(
+            operands=[src, dst, n],
+            result_types=[],
+            properties={"scalar": FloatAttr(scalar, Float32Type())},
+        )
+
+    def verify_(self) -> None:
+        src_type = self.src.type
+        dst_type = self.dst.type
+        if src_type != dst_type:
+            raise VerifyException(
+                f"npu.fvmul: src and dst must have the same type, "
+                f"got {src_type} and {dst_type}"
+            )
+        assert isinstance(src_type, MemRefType)
+        if not isinstance(src_type.element_type, Float32Type):
+            raise VerifyException(
+                f"npu.fvmul: expected f32 element type, got {src_type.element_type}"
+            )
+        if isinstance(self.n.owner, arith.ConstantOp):
+            n_attr = self.n.owner.value
+            if isinstance(n_attr, IntegerAttr):
+                n_val = n_attr.value.data
+                if n_val > NPU_MAX_VEC_LEN:
+                    raise VerifyException(
+                        f"npu.fvmul: n={n_val} exceeds NPU vector length "
+                        f"limit ({NPU_MAX_VEC_LEN})"
+                    )
+
+
+@irdl_op_definition
+class FVDivOp(IRDLOperation):
+    """Vector divide by scalar: dst[i] = src[i] / scalar.
+
+    Maps to NPU.FVDIV (opcode=0x2B, funct7=0x0B).
+    The scalar is loaded into facc before execution.
+    """
+
+    name = "npu.fvdiv"
+
+    src = operand_def(MemRefType)
+    dst = operand_def(MemRefType)
+    n = operand_def(IndexType)
+    scalar = prop_def(FloatAttr)
+
+    irdl_options = (ParsePropInAttrDict(),)
+
+    assembly_format = (
+        "$src `,` $dst `,` $n attr-dict"
+        " `:` type($src) `,` type($dst) `,` type($n)"
+    )
+
+    def __init__(
+        self,
+        src: SSAValue | Operation,
+        dst: SSAValue | Operation,
+        n: SSAValue | Operation,
+        scalar: float,
+    ) -> None:
+        super().__init__(
+            operands=[src, dst, n],
+            result_types=[],
+            properties={"scalar": FloatAttr(scalar, Float32Type())},
+        )
+
+    def verify_(self) -> None:
+        src_type = self.src.type
+        dst_type = self.dst.type
+        if src_type != dst_type:
+            raise VerifyException(
+                f"npu.fvdiv: src and dst must have the same type, "
+                f"got {src_type} and {dst_type}"
+            )
+        assert isinstance(src_type, MemRefType)
+        if not isinstance(src_type.element_type, Float32Type):
+            raise VerifyException(
+                f"npu.fvdiv: expected f32 element type, got {src_type.element_type}"
+            )
+        if isinstance(self.n.owner, arith.ConstantOp):
+            n_attr = self.n.owner.value
+            if isinstance(n_attr, IntegerAttr):
+                n_val = n_attr.value.data
+                if n_val > NPU_MAX_VEC_LEN:
+                    raise VerifyException(
+                        f"npu.fvdiv: n={n_val} exceeds NPU vector length "
+                        f"limit ({NPU_MAX_VEC_LEN})"
+                    )
+
+
+NPUDialect = Dialect(
+    "npu", [FVAddOp, FVSubOp, FVReluOp, FVExpOp, FVMulOp, FVDivOp], []
+)

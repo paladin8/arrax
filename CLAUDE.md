@@ -31,8 +31,9 @@ MLIR-based compiler that fuses array expressions in Python and emits optimized R
 
 ## Compiler pipeline
 ```
-Python DSL (tracing) -> array dialect -> linalg dialect -> tiling -> fusion
--> bufferize (tensor->memref) -> npu dialect -> RISC-V assembly (.S)
+Python DSL (tracing) -> array dialect -> linalg dialect
+-> bufferize (tensor->memref) -> tiling -> fusion -> buffer optimize
+-> npu dialect -> RISC-V assembly (.S)
 -> riscv32 toolchain -> ELF -> riscv-npu emulator
 ```
 

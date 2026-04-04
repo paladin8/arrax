@@ -120,6 +120,21 @@ builtin.module {
         # 2 affine maps (1 input + 1 output), not 3
         assert ir.count("affine_map<(d0) -> (d0)>") == 2
 
+    def test_mul_scalar(self) -> None:
+        module = make_module(lambda A: A * 3.0, {"A": (64,)})
+        lower_to_linalg(module)
+        ir = str(module)
+        assert "arith.mulf" in ir
+        assert "linalg.generic" in ir
+        assert "array.mul_scalar" not in ir
+
+    def test_div_scalar(self) -> None:
+        module = make_module(lambda A: A / 2.0, {"A": (64,)})
+        lower_to_linalg(module)
+        ir = str(module)
+        assert "arith.divf" in ir
+        assert "array.div_scalar" not in ir
+
     def test_2d_tensor(self) -> None:
         """Lowering generalizes to multi-dimensional tensors."""
         module = make_module(lambda A, B: A + B, {"A": (8, 16), "B": (8, 16)})

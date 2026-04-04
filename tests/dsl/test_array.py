@@ -109,6 +109,26 @@ class TestArray:
         inner = result.operands[0]
         assert inner.op == "add"
 
+    def test_mul_scalar(self) -> None:
+        a = Array("A", (64,))
+        r = a * 3.0
+        assert r.op == "mul_scalar"
+        assert r.scalar == 3.0
+        assert len(r.operands) == 1
+        assert r.operands[0] is a
+
+    def test_rmul_scalar(self) -> None:
+        a = Array("A", (64,))
+        r = 2.0 * a
+        assert r.op == "mul_scalar"
+        assert r.scalar == 2.0
+
+    def test_div_scalar(self) -> None:
+        a = Array("A", (64,))
+        r = a / 4.0
+        assert r.op == "div_scalar"
+        assert r.scalar == 4.0
+
     def test_2d_shape(self) -> None:
         a = Array("A", (32, 64))
         b = Array("B", (32, 64))

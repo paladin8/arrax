@@ -8,7 +8,15 @@ from xdsl.dialects.builtin import Float32Type, ModuleOp, TensorType
 from xdsl.utils.exceptions import VerifyException
 from xdsl.utils.test_value import create_ssa_value
 
-from arrax.dialects.array_dialect import AddOp, ArrayDialect, ExpOp, ReluOp, SubOp
+from arrax.dialects.array_dialect import (
+    AddOp,
+    ArrayDialect,
+    DivScalarOp,
+    ExpOp,
+    MulScalarOp,
+    ReluOp,
+    SubOp,
+)
 
 
 class TestArrayDialect:
@@ -212,3 +220,43 @@ class TestExpOp:
 
         ir_text = str(module)
         assert "array.exp" in ir_text
+
+
+class TestMulScalarOp:
+    def test_construction(self) -> None:
+        tensor_type = TensorType(Float32Type(), [64])
+        input_val = create_ssa_value(tensor_type)
+        op = MulScalarOp(input_val, 3.0)
+
+        assert op.input == input_val
+        assert op.result.type == tensor_type
+
+    def test_ir_prints_correctly(self) -> None:
+        tensor_type = TensorType(Float32Type(), [64])
+        input_val = create_ssa_value(tensor_type)
+        op = MulScalarOp(input_val, 3.0)
+        module = ModuleOp([input_val.owner, op])
+
+        ir_text = str(module)
+        assert "array.mul_scalar" in ir_text
+        assert "3.0" in ir_text
+
+
+class TestDivScalarOp:
+    def test_construction(self) -> None:
+        tensor_type = TensorType(Float32Type(), [64])
+        input_val = create_ssa_value(tensor_type)
+        op = DivScalarOp(input_val, 2.0)
+
+        assert op.input == input_val
+        assert op.result.type == tensor_type
+
+    def test_ir_prints_correctly(self) -> None:
+        tensor_type = TensorType(Float32Type(), [64])
+        input_val = create_ssa_value(tensor_type)
+        op = DivScalarOp(input_val, 2.0)
+        module = ModuleOp([input_val.owner, op])
+
+        ir_text = str(module)
+        assert "array.div_scalar" in ir_text
+        assert "2.0" in ir_text

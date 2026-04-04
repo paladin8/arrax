@@ -6,7 +6,14 @@ from xdsl.dialects.builtin import Float32Type, ModuleOp, TensorType
 from xdsl.dialects.func import FuncOp, ReturnOp
 from xdsl.ir import SSAValue
 
-from arrax.dialects.array_dialect import AddOp, ExpOp, ReluOp, SubOp
+from arrax.dialects.array_dialect import (
+    AddOp,
+    DivScalarOp,
+    ExpOp,
+    MulScalarOp,
+    ReluOp,
+    SubOp,
+)
 from arrax.dsl.array import Array
 
 
@@ -70,6 +77,18 @@ def dsl_to_array(
             exp_op = ExpOp(operand)
             entry_block.add_op(exp_op)
             val = exp_op.result
+        elif node.op == "mul_scalar":
+            assert node.scalar is not None
+            operand = lower(node.operands[0])
+            mul_op = MulScalarOp(operand, node.scalar)
+            entry_block.add_op(mul_op)
+            val = mul_op.result
+        elif node.op == "div_scalar":
+            assert node.scalar is not None
+            operand = lower(node.operands[0])
+            div_op = DivScalarOp(operand, node.scalar)
+            entry_block.add_op(div_op)
+            val = div_op.result
         else:
             raise ValueError(f"unsupported operation: {node.op}")
 

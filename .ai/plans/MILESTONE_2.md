@@ -82,21 +82,19 @@ NPU dialect:
 
 Assembly emission sequence for FVMUL:
 ```asm
-    # Load scalar into facc (once, before the tiled loop)
+    # Inside the loop body (emitted inline with each scalar op):
     .insn r 0x2B, 0x5, 0x00, f0, f0, f0   # FRSTACC: zero facc
     li t0, <scalar_bits>                     # IEEE 754 float32 bits
     fmv.w.x f1, t0                           # integer -> float register
     lui t0, 0x3F800                           # 1.0f
     fmv.w.x f2, t0
     .insn r 0x2B, 0x0, 0x00, f0, f1, f2    # FMACC: facc = scalar * 1.0
-
-    # Tiled loop
-    scf.for ... {
-        .insn r 0x2B, 0x0, 0x04, rd, rs1, rs2  # FVMUL: dst[i] = src[i] * facc
-    }
+    .insn r 0x2B, 0x0, 0x04, rd, rs1, rs2  # FVMUL: dst[i] = src[i] * facc
 ```
 
-Key: facc persists across iterations, so the load happens once outside the loop.
+Note: facc load is emitted inline per scalar op. In tiled loops this reloads facc
+each iteration (redundant but correct). A future optimization could hoist the load
+before the loop since facc persists across iterations.
 
 ## Fusion
 

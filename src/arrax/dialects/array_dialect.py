@@ -5,12 +5,14 @@ from __future__ import annotations
 from xdsl.ir import Dialect, SSAValue, Operation
 from xdsl.irdl import (
     IRDLOperation,
+    ParsePropInAttrDict,
     irdl_op_definition,
     operand_def,
+    prop_def,
     result_def,
     traits_def,
 )
-from xdsl.dialects.builtin import TensorType
+from xdsl.dialects.builtin import Float32Type, FloatAttr, TensorType
 from xdsl.traits import Pure
 from xdsl.utils.exceptions import VerifyException
 
@@ -117,4 +119,60 @@ class ExpOp(IRDLOperation):
         super().__init__(operands=[input], result_types=[input_val.type])
 
 
-ArrayDialect = Dialect("array", [AddOp, SubOp, ReluOp, ExpOp], [])
+@irdl_op_definition
+class MulScalarOp(IRDLOperation):
+    """Elementwise multiply by scalar: result[i] = input[i] * scalar."""
+
+    name = "array.mul_scalar"
+
+    input = operand_def(TensorType)
+    result = result_def(TensorType)
+    scalar = prop_def(FloatAttr)
+
+    irdl_options = (ParsePropInAttrDict(),)
+
+    assembly_format = (
+        "$input attr-dict `:` type($input) `->` type($result)"
+    )
+
+    traits = traits_def(Pure())
+
+    def __init__(self, input: SSAValue | Operation, scalar: float) -> None:
+        input_val = SSAValue.get(input)
+        super().__init__(
+            operands=[input],
+            result_types=[input_val.type],
+            properties={"scalar": FloatAttr(scalar, Float32Type())},
+        )
+
+
+@irdl_op_definition
+class DivScalarOp(IRDLOperation):
+    """Elementwise divide by scalar: result[i] = input[i] / scalar."""
+
+    name = "array.div_scalar"
+
+    input = operand_def(TensorType)
+    result = result_def(TensorType)
+    scalar = prop_def(FloatAttr)
+
+    irdl_options = (ParsePropInAttrDict(),)
+
+    assembly_format = (
+        "$input attr-dict `:` type($input) `->` type($result)"
+    )
+
+    traits = traits_def(Pure())
+
+    def __init__(self, input: SSAValue | Operation, scalar: float) -> None:
+        input_val = SSAValue.get(input)
+        super().__init__(
+            operands=[input],
+            result_types=[input_val.type],
+            properties={"scalar": FloatAttr(scalar, Float32Type())},
+        )
+
+
+ArrayDialect = Dialect(
+    "array", [AddOp, SubOp, ReluOp, ExpOp, MulScalarOp, DivScalarOp], []
+)

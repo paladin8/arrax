@@ -15,6 +15,7 @@ class Array:
         self.shape = shape
         self.op: str | None = None
         self.operands: list[Array] = []
+        self.scalar: float | None = None
 
     def __add__(self, other: Array) -> Array:
         result = Array(name="", shape=self.shape)
@@ -26,6 +27,23 @@ class Array:
         result = Array(name="", shape=self.shape)
         result.op = "sub"
         result.operands = [self, other]
+        return result
+
+    def __mul__(self, other: float) -> Array:
+        result = Array(name="", shape=self.shape)
+        result.op = "mul_scalar"
+        result.operands = [self]
+        result.scalar = float(other)
+        return result
+
+    def __rmul__(self, other: float) -> Array:
+        return self.__mul__(other)
+
+    def __truediv__(self, other: float) -> Array:
+        result = Array(name="", shape=self.shape)
+        result.op = "div_scalar"
+        result.operands = [self]
+        result.scalar = float(other)
         return result
 
     @property

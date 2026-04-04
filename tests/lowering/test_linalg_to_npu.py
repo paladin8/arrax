@@ -237,6 +237,20 @@ builtin.module {
         assert "npu.fvexp" in ir
         assert "scf.for" in ir
 
+    def test_mul_scalar(self) -> None:
+        module = make_module(lambda A: A * 3.0, {"A": (64,)})
+        _lower_to_npu(module)
+        ir = str(module)
+        assert "npu.fvmul" in ir
+        assert "linalg.generic" not in ir
+
+    def test_div_scalar(self) -> None:
+        module = make_module(lambda A: A / 2.0, {"A": (64,)})
+        _lower_to_npu(module)
+        ir = str(module)
+        assert "npu.fvdiv" in ir
+        assert "linalg.generic" not in ir
+
     def test_tiled_no_arith_constant_for_n(self) -> None:
         """After tiling, n comes from minsi — no new arith.constant for element count."""
         module = make_module(lambda A, B: A + B, {"A": (128,), "B": (128,)})

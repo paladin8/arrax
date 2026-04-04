@@ -25,7 +25,14 @@ from xdsl.pattern_rewriter import (
     op_type_rewrite_pattern,
 )
 
-from arrax.dialects.array_dialect import AddOp, ExpOp, ReluOp, SubOp
+from arrax.dialects.array_dialect import (
+    AddOp,
+    DivScalarOp,
+    ExpOp,
+    MulScalarOp,
+    ReluOp,
+    SubOp,
+)
 
 
 class AddToLinalgPattern(RewritePattern):
@@ -170,6 +177,76 @@ class ExpToLinalgPattern(RewritePattern):
         rewriter.replace_matched_op([empty, generic], [generic.res[0]])
 
 
+class MulScalarToLinalgPattern(RewritePattern):
+    """Rewrite array.mul_scalar to linalg.generic with arith.mulf(x, const) body."""
+
+    @op_type_rewrite_pattern
+    def match_and_rewrite(self, op: MulScalarOp, rewriter: PatternRewriter) -> None:
+        result_type = op.result.type
+        assert isinstance(result_type, TensorType)
+        f32 = Float32Type()
+
+        empty = tensor.EmptyOp([], result_type)
+
+        ndims = len(result_type.get_shape())
+        identity = AffineMap.identity(ndims)
+        maps = [AffineMapAttr(identity)] * 2
+        iters = [IteratorTypeAttr.parallel() for _ in range(ndims)]
+
+        scalar_types = [f32] * 2
+        block = Block(arg_types=scalar_types)
+        const = arith.ConstantOp(op.scalar)
+        mul = arith.MulfOp(block.args[0], const.result)
+        yield_op = linalg.YieldOp(mul.result)
+        block.add_ops([const, mul, yield_op])
+        body = Region([block])
+
+        generic = linalg.GenericOp(
+            inputs=[op.input],
+            outputs=[empty.tensor],
+            body=body,
+            indexing_maps=maps,
+            iterator_types=iters,
+            result_types=[result_type],
+        )
+        rewriter.replace_matched_op([empty, generic], [generic.res[0]])
+
+
+class DivScalarToLinalgPattern(RewritePattern):
+    """Rewrite array.div_scalar to linalg.generic with arith.divf(x, const) body."""
+
+    @op_type_rewrite_pattern
+    def match_and_rewrite(self, op: DivScalarOp, rewriter: PatternRewriter) -> None:
+        result_type = op.result.type
+        assert isinstance(result_type, TensorType)
+        f32 = Float32Type()
+
+        empty = tensor.EmptyOp([], result_type)
+
+        ndims = len(result_type.get_shape())
+        identity = AffineMap.identity(ndims)
+        maps = [AffineMapAttr(identity)] * 2
+        iters = [IteratorTypeAttr.parallel() for _ in range(ndims)]
+
+        scalar_types = [f32] * 2
+        block = Block(arg_types=scalar_types)
+        const = arith.ConstantOp(op.scalar)
+        div = arith.DivfOp(block.args[0], const.result)
+        yield_op = linalg.YieldOp(div.result)
+        block.add_ops([const, div, yield_op])
+        body = Region([block])
+
+        generic = linalg.GenericOp(
+            inputs=[op.input],
+            outputs=[empty.tensor],
+            body=body,
+            indexing_maps=maps,
+            iterator_types=iters,
+            result_types=[result_type],
+        )
+        rewriter.replace_matched_op([empty, generic], [generic.res[0]])
+
+
 @dataclass(frozen=True)
 class ArrayToLinalgPass(ModulePass):
     """Lower array dialect ops to linalg.generic on tensors."""
@@ -183,5 +260,7 @@ class ArrayToLinalgPass(ModulePass):
                 SubToLinalgPattern(),
                 ReluToLinalgPattern(),
                 ExpToLinalgPattern(),
+                MulScalarToLinalgPattern(),
+                DivScalarToLinalgPattern(),
             ])
         ).rewrite_module(op)

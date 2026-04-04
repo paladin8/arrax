@@ -305,6 +305,117 @@ class TestEndToEnd:
         expected = np.exp(np.ones(N, dtype=np.float32) * 0.5)
         np.testing.assert_allclose(actual, expected, rtol=1e-5)
 
+    def test_mul_scalar(self, tmp_path: Path) -> None:
+        """A * 3.0: scalar-vector multiply."""
+        N = 128
+        A = np.arange(N, dtype=np.float32)
+        expected = A * 3.0
+
+        actual, _ = _compile_and_run(
+            lambda A: A * 3.0,
+            {"A": (N,)},
+            {"A": A},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-6)
+
+    def test_rmul_scalar(self, tmp_path: Path) -> None:
+        """2.5 * A: reverse multiply."""
+        N = 64
+        A = np.linspace(-5.0, 5.0, N, dtype=np.float32)
+        expected = 2.5 * A
+
+        actual, _ = _compile_and_run(
+            lambda A: 2.5 * A,
+            {"A": (N,)},
+            {"A": A},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-6)
+
+    def test_div_scalar(self, tmp_path: Path) -> None:
+        """A / 2.0: scalar-vector divide."""
+        N = 128
+        A = np.arange(N, dtype=np.float32) + 1.0
+        expected = A / 2.0
+
+        actual, _ = _compile_and_run(
+            lambda A: A / 2.0,
+            {"A": (N,)},
+            {"A": A},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-6)
+
+    def test_add_then_mul_scalar(self, tmp_path: Path) -> None:
+        """(A + B) * 0.5: chained binary + scalar-vector."""
+        N = 100
+
+        def kernel(A: Array, B: Array) -> Array:
+            return (A + B) * 0.5
+
+        A = np.arange(N, dtype=np.float32)
+        B = np.ones(N, dtype=np.float32) * 10
+        expected = (A + B) * 0.5
+
+        actual, _ = _compile_and_run(
+            kernel,
+            {"A": (N,), "B": (N,)},
+            {"A": A, "B": B},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-6)
+
+    def test_mul_negative_scalar(self, tmp_path: Path) -> None:
+        """A * -2.0: negative scalar."""
+        N = 64
+        A = np.arange(N, dtype=np.float32)
+        expected = A * -2.0
+
+        actual, _ = _compile_and_run(
+            lambda A: A * -2.0,
+            {"A": (N,)},
+            {"A": A},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-6)
+
+    def test_chained_scalar_ops(self, tmp_path: Path) -> None:
+        """(A * 3.0) / 2.0: two scalar ops with different facc values."""
+        N = 128
+
+        def kernel(A: Array) -> Array:
+            return (A * 3.0) / 2.0
+
+        A = np.arange(N, dtype=np.float32) + 1.0
+        expected = (A * 3.0) / 2.0
+
+        actual, _ = _compile_and_run(
+            kernel,
+            {"A": (N,)},
+            {"A": A},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-5)
+
+    def test_relu_of_mul_scalar(self, tmp_path: Path) -> None:
+        """relu(A * 2.0): scalar + unary fusion."""
+        N = 100
+
+        def kernel(A: Array) -> Array:
+            return relu(A * 2.0)
+
+        A = np.linspace(-5.0, 5.0, N, dtype=np.float32)
+        expected = np.maximum(A * 2.0, 0.0)
+
+        actual, _ = _compile_and_run(
+            kernel,
+            {"A": (N,)},
+            {"A": A},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-6)
+
     def test_relu_add_relu_sub(self, tmp_path: Path) -> None:
         """relu(A+B) + relu(C-D): 4 intermediates, buffer reuse exercised."""
         N = 128
