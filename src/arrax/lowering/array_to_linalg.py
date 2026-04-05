@@ -32,6 +32,7 @@ from arrax.dialects.array_dialect import (
     MulScalarOp,
     ReluOp,
     SubOp,
+    SumOp,
 )
 
 
@@ -247,6 +248,62 @@ class DivScalarToLinalgPattern(RewritePattern):
         rewriter.replace_matched_op([empty, generic], [generic.res[0]])
 
 
+class SumToLinalgPattern(RewritePattern):
+    """Rewrite array.sum to linalg.fill + linalg.generic reduction.
+
+    The reduction generic takes the rank-1 input and a rank-0 output that
+    has been initialized to 0.0 via linalg.fill. Its body adds the current
+    accumulator to each input element:
+
+        outs initialized via linalg.fill(0.0)
+        body: ^bb0(%in, %acc): %s = addf %acc, %in; yield %s
+    """
+
+    @op_type_rewrite_pattern
+    def match_and_rewrite(self, op: SumOp, rewriter: PatternRewriter) -> None:
+        input_type = op.input.type
+        assert isinstance(input_type, TensorType)
+        result_type = op.result.type
+        assert isinstance(result_type, TensorType)
+        f32 = Float32Type()
+
+        # Rank-0 destination tensor, seeded with 0.0 via linalg.fill
+        empty = tensor.EmptyOp([], result_type)
+        zero = arith.ConstantOp(FloatAttr(0.0, f32))
+        fill = linalg.FillOp(
+            inputs=[zero.result],
+            outputs=[empty.tensor],
+            res=[result_type],
+        )
+
+        # Affine maps: input is (d0) -> (d0); output is (d0) -> () (scalar sink)
+        d0 = AffineMap.identity(1)
+        scalar_sink = AffineMap.from_callable(lambda d0: ())
+        maps = [AffineMapAttr(d0), AffineMapAttr(scalar_sink)]
+        iters = [IteratorTypeAttr.reduction()]
+
+        # Body: addf(acc, in), yield.
+        # Block args are (in, out_current_acc).
+        scalar_types = [f32, f32]
+        block = Block(arg_types=scalar_types)
+        add = arith.AddfOp(block.args[1], block.args[0])
+        yield_op = linalg.YieldOp(add.result)
+        block.add_ops([add, yield_op])
+        body = Region([block])
+
+        generic = linalg.GenericOp(
+            inputs=[op.input],
+            outputs=[fill.res[0]],
+            body=body,
+            indexing_maps=maps,
+            iterator_types=iters,
+            result_types=[result_type],
+        )
+        rewriter.replace_matched_op(
+            [empty, zero, fill, generic], [generic.res[0]]
+        )
+
+
 @dataclass(frozen=True)
 class ArrayToLinalgPass(ModulePass):
     """Lower array dialect ops to linalg.generic on tensors."""
@@ -262,5 +319,6 @@ class ArrayToLinalgPass(ModulePass):
                 ExpToLinalgPattern(),
                 MulScalarToLinalgPattern(),
                 DivScalarToLinalgPattern(),
+                SumToLinalgPattern(),
             ])
         ).rewrite_module(op)

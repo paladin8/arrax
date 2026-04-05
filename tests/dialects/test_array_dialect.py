@@ -16,6 +16,7 @@ from arrax.dialects.array_dialect import (
     MulScalarOp,
     ReluOp,
     SubOp,
+    SumOp,
 )
 
 
@@ -260,3 +261,67 @@ class TestDivScalarOp:
         ir_text = str(module)
         assert "array.div_scalar" in ir_text
         assert "2.0" in ir_text
+
+
+class TestSumOp:
+    def test_construction(self) -> None:
+        input_type = TensorType(Float32Type(), [128])
+        result_type = TensorType(Float32Type(), [])
+        input_val = create_ssa_value(input_type)
+        op = SumOp(input_val)
+
+        assert op.input == input_val
+        assert op.result.type == result_type
+
+    def test_verify_rank1_f32_to_rank0(self) -> None:
+        input_type = TensorType(Float32Type(), [64])
+        input_val = create_ssa_value(input_type)
+        op = SumOp(input_val)
+        op.verify()
+
+    def test_verify_rank2_input_fails(self) -> None:
+        """SumOp requires a rank-1 input."""
+        input_type = TensorType(Float32Type(), [32, 64])
+        input_val = create_ssa_value(input_type)
+        op = SumOp(input_val)
+        with pytest.raises(VerifyException, match="rank-1"):
+            op.verify()
+
+    def test_verify_rank0_input_fails(self) -> None:
+        """SumOp cannot reduce a rank-0 tensor."""
+        input_type = TensorType(Float32Type(), [])
+        input_val = create_ssa_value(input_type)
+        op = SumOp(input_val)
+        with pytest.raises(VerifyException, match="rank-1"):
+            op.verify()
+
+    def test_ir_prints_correctly(self) -> None:
+        input_type = TensorType(Float32Type(), [128])
+        input_val = create_ssa_value(input_type)
+        op = SumOp(input_val)
+        module = ModuleOp([input_val.owner, op])
+        ir = str(module)
+        assert "array.sum" in ir
+        assert "tensor<128xf32>" in ir
+        assert "tensor<f32>" in ir
+
+    def test_ir_round_trips(self) -> None:
+        """assembly_format parses back correctly."""
+        from xdsl.context import Context
+        from xdsl.parser import Parser
+        from xdsl.dialects.builtin import Builtin
+        from xdsl.dialects.func import Func
+
+        ir_text = """\
+builtin.module {
+  func.func @test(%a: tensor<128xf32>) -> tensor<f32> {
+    %0 = array.sum %a : tensor<128xf32> -> tensor<f32>
+    func.return %0 : tensor<f32>
+  }
+}"""
+        ctx = Context()
+        ctx.load_dialect(Builtin)
+        ctx.load_dialect(ArrayDialect)
+        ctx.load_dialect(Func)
+        module = Parser(ctx, ir_text).parse_module()
+        module.verify()

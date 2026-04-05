@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from arrax.dsl.array import Array, exp, relu
+from arrax.dsl.array import Array, exp, relu, sum
 
 
 class TestArray:
@@ -134,3 +134,30 @@ class TestArray:
         b = Array("B", (32, 64))
         c = a + b
         assert c.shape == (32, 64)
+
+    def test_rank0_construction(self) -> None:
+        """Array accepts shape=() for scalar (rank-0) values."""
+        a = Array("s", ())
+        assert a.shape == ()
+        assert a.is_leaf
+        assert a.op is None
+
+    def test_sum_creates_dag_node(self) -> None:
+        """sum(A) builds a rank-0 DAG node."""
+        a = Array("A", (1024,))
+        s = sum(a)
+        assert s.op == "sum"
+        assert not s.is_leaf
+        assert s.shape == ()
+        assert len(s.operands) == 1
+        assert s.operands[0] is a
+
+    def test_sum_of_add(self) -> None:
+        """sum(A + B) is a rank-0 reduction of an elementwise node."""
+        a = Array("A", (100,))
+        b = Array("B", (100,))
+        s = sum(a + b)
+        assert s.op == "sum"
+        assert s.shape == ()
+        inner = s.operands[0]
+        assert inner.op == "add"

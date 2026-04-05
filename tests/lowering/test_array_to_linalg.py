@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from arrax.dsl.array import Array, exp, relu
+from arrax.dsl.array import Array, exp, relu, sum
 from tests.helpers import lower_to_linalg, make_module
 
 
@@ -143,3 +143,29 @@ builtin.module {
         assert "tensor<8x16xf32>" in ir
         assert "(d0, d1) -> (d0, d1)" in ir
         assert '"parallel", "parallel"' in ir
+
+    def test_sum_lowers_to_reduction_generic(self) -> None:
+        """sum(A) becomes tensor.empty + linalg.fill(0.0) + reduction generic."""
+        module = make_module(lambda A: sum(A), {"A": (128,)})
+        lower_to_linalg(module)
+        ir = str(module)
+        assert "array.sum" not in ir
+        assert "tensor.empty() : tensor<f32>" in ir
+        assert "linalg.fill" in ir
+        assert "linalg.generic" in ir
+        assert '"reduction"' in ir
+        # identity body: addf(acc, in)
+        assert "arith.addf" in ir
+        # sink map to rank-0
+        assert "(d0) -> ()" in ir
+
+    def test_sum_of_add_produces_two_generics(self) -> None:
+        """sum(A + B) produces one parallel generic + one reduction generic."""
+        module = make_module(
+            lambda A, B: sum(A + B), {"A": (64,), "B": (64,)}
+        )
+        lower_to_linalg(module)
+        ir = str(module)
+        assert ir.count("linalg.generic") == 2
+        assert '"parallel"' in ir
+        assert '"reduction"' in ir

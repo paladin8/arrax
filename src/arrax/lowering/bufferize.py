@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from xdsl.context import Context
-from xdsl.dialects import func, linalg, memref, tensor
+from xdsl.dialects import arith, func, linalg, memref, tensor
 from xdsl.dialects.builtin import MemRefType, ModuleOp, TensorType
 from xdsl.ir import Block, Region, SSAValue
 from xdsl.passes import ModulePass
@@ -59,16 +59,26 @@ class BufferizePass(ModulePass):
         memref_outputs = [_tensor_to_memref(t) for t in old_output_types]
         all_arg_types = memref_inputs + memref_outputs
 
-        # Find the final tensor.empty: trace back from func.return
+        # Find the terminal tensor.empty: trace back from func.return through
+        # the terminal generic's outs chain. For elementwise ops the outs is
+        # tensor.empty directly; for reductions it is linalg.fill whose own
+        # outs is tensor.empty.
         # NOTE: only single-result functions are supported (Milestone 1 scope)
         return_op = self._find_return(old_block)
         final_empty_op: tensor.EmptyOp | None = None
+        final_fill_op: linalg.FillOp | None = None
         if return_op.arguments:
             returned_val = return_op.arguments[0]
             assert isinstance(returned_val.owner, linalg.GenericOp)
             final_outs_val = list(returned_val.owner.outputs)[0]
-            assert isinstance(final_outs_val.owner, tensor.EmptyOp)
-            final_empty_op = final_outs_val.owner
+            if isinstance(final_outs_val.owner, linalg.FillOp):
+                final_fill_op = final_outs_val.owner
+                fill_outs_val = list(final_fill_op.outputs)[0]
+                assert isinstance(fill_outs_val.owner, tensor.EmptyOp)
+                final_empty_op = fill_outs_val.owner
+            else:
+                assert isinstance(final_outs_val.owner, tensor.EmptyOp)
+                final_empty_op = final_outs_val.owner
 
         # Build new block with memref args
         new_block = Block(arg_types=all_arg_types)
@@ -78,10 +88,15 @@ class BufferizePass(ModulePass):
         for old_arg, new_arg in zip(old_block.args, new_block.args):
             value_map[old_arg] = new_arg
 
-        # Map final tensor.empty result → output memref function arg
+        # Map final tensor.empty result → output memref function arg.
+        # If a terminal fill sits between empty and the generic, map its
+        # result to the same output arg so the downstream generic's outs
+        # resolves to the function arg directly.
         if final_empty_op is not None:
             output_arg = new_block.args[len(memref_inputs)]
             value_map[final_empty_op.tensor] = output_arg
+            if final_fill_op is not None:
+                value_map[final_fill_op.res[0]] = output_arg
 
         # Walk old ops and emit bufferized versions
         for op in old_block.ops:
@@ -93,6 +108,25 @@ class BufferizePass(ModulePass):
                 alloc = memref.AllocOp([], [], memref_type)
                 new_block.add_op(alloc)
                 value_map[op.tensor] = alloc.memref
+
+            elif isinstance(op, arith.ConstantOp):
+                # Float constants materialize scalar seeds (e.g., linalg.fill
+                # inputs for reduction identity). Clone verbatim.
+                cloned = op.clone()
+                new_block.add_op(cloned)
+                value_map[op.result] = cloned.result
+
+            elif isinstance(op, linalg.FillOp):
+                new_outs = [value_map[v] for v in op.outputs]
+                new_ins = [value_map[v] for v in op.inputs]
+                new_fill = linalg.FillOp(
+                    inputs=new_ins,
+                    outputs=new_outs,
+                    res=[],  # memref semantics: no results
+                )
+                new_block.add_op(new_fill)
+                if op.res:
+                    value_map[op.res[0]] = new_outs[0]
 
             elif isinstance(op, linalg.GenericOp):
                 new_ins = [value_map[v] for v in op.inputs]

@@ -156,6 +156,13 @@ def _fuse_block(block: Block) -> bool:
                 continue
             if not _same_bounds(first, second):
                 continue
+            # Safety: refuse to fuse if either loop carries iter_args.
+            # Parallel→reduction fusion (matching bounds, different iter_arg
+            # shapes) lands in Phase 5; Phase 1 must not silently merge a
+            # parallel elementwise loop with a reduction loop whose
+            # iter_args and scf.yield would be dropped on the floor.
+            if first.iter_args or second.iter_args:
+                continue
             # Hoist any alloc ops between the loops to before first
             for k in range(i + 1, j):
                 if isinstance(ops[k], memref.AllocOp):

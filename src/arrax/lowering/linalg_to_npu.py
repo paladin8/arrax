@@ -8,6 +8,7 @@ from xdsl.context import Context
 from xdsl.dialects import arith, linalg, math, memref
 from xdsl.dialects.builtin import (
     DYNAMIC_INDEX,
+    Float32Type,
     FloatAttr,
     IndexType,
     IntegerAttr,
@@ -31,6 +32,7 @@ from arrax.dialects.npu_dialect import (
     FVDivOp,
     FVExpOp,
     FVMulOp,
+    FVReduceOp,
     FVReluOp,
     FVSubOp,
 )
@@ -205,6 +207,150 @@ class LinalgElementwiseToNpuPattern(RewritePattern):
         rewriter.replace_matched_op([*extra_ops, npu_op], [])
 
 
+class LinalgReductionToNpuPattern(RewritePattern):
+    """Match a rank-0 reduction cluster and collapse to an npu reduction op.
+
+    Two input shapes are matched, anchored on the reduction linalg.generic:
+
+    1. Untiled (N <= 64): the generic is in straight-line code with a
+       preceding ``linalg.fill`` seeding its rank-0 output with the identity
+       constant. The cluster collapses to a single ``npu.fvreduce`` whose
+       ``acc_in`` is the identity and whose result is stored to the output
+       memref after the op via ``memref.store``.
+
+    2. Tiled (N > 64): the generic lives inside an ``scf.for`` body. Its
+       ``outs`` is a per-iteration rank-0 ``memref.alloca`` seeded via
+       ``linalg.fill(acc)`` where ``acc`` is the loop's iter_arg. A
+       subsequent ``memref.load`` reads the new accumulator and feeds
+       ``scf.yield``. The ``alloca + fill + generic + load`` cluster
+       collapses to a single ``npu.fvreduce`` whose ``result`` replaces
+       the load and flows directly into ``scf.yield``.
+
+    Body shape currently handled: ``arith.addf(a, b), linalg.yield`` where
+    ``{a, b}`` is the pair of block arguments (order irrelevant). That is
+    the sum body; amax/dot/mean will be added in later phases.
+    """
+
+    @op_type_rewrite_pattern
+    def match_and_rewrite(
+        self, op: linalg.GenericOp, rewriter: PatternRewriter
+    ) -> None:
+        # Single reduction iterator
+        if len(op.iterator_types.data) != 1:
+            return
+        if op.iterator_types.data[0].data != IteratorType.REDUCTION:
+            return
+
+        # Rank-0 f32 memref output
+        outputs = list(op.outputs)
+        if len(outputs) != 1:
+            return
+        out_val = outputs[0]
+        out_type = out_val.type
+        if not isinstance(out_type, MemRefType):
+            return
+        if len(out_type.get_shape()) != 0:
+            return
+        if not isinstance(out_type.element_type, Float32Type):
+            return
+
+        # Single rank-1 f32 memref input (sum/amax/mean form)
+        inputs = list(op.inputs)
+        if len(inputs) != 1:
+            return
+        src = inputs[0]
+        src_type = src.type
+        if not isinstance(src_type, MemRefType):
+            return
+        if len(src_type.get_shape()) != 1:
+            return
+        if not isinstance(src_type.element_type, Float32Type):
+            return
+
+        # Body must be: addf(bb0, bb1), yield
+        body_block = op.body.blocks.first
+        if body_block is None:
+            return
+        body_ops = list(body_block.ops)
+        if len(body_ops) != 2:
+            return
+        if not isinstance(body_ops[0], arith.AddfOp):
+            return
+        if not isinstance(body_ops[1], linalg.YieldOp):
+            return
+        addf = body_ops[0]
+        bargs = set(body_block.args)
+        if {addf.lhs, addf.rhs} != bargs:
+            return
+        yield_op = body_ops[1]
+        if list(yield_op.operands) != [addf.result]:
+            return
+
+        # Find the fill that seeds our outs (must be in the same block,
+        # directly before the generic after the alloca in the tiled case).
+        fill = _find_preceding_fill(op, out_val)
+        if fill is None:
+            return
+        acc_in = list(fill.inputs)[0]
+
+        # Extract the element count
+        extracted = _extract_n(src, rewriter)
+        if extracted is None:
+            return
+        extra_ops, n_ssa = extracted
+
+        # Build the npu.fvreduce op
+        fvreduce = FVReduceOp(src, n_ssa, acc_in)
+
+        load = _find_following_load(op, out_val)
+        if load is not None:
+            # Tiled case: fvreduce.result takes the load's place.
+            alloca_op: memref.AllocaOp | None = None
+            if isinstance(out_val.owner, memref.AllocaOp):
+                alloca_op = out_val.owner
+
+            # 1. Replace generic with [extra_ops, fvreduce].
+            rewriter.replace_matched_op([*extra_ops, fvreduce], [])
+            # 2. Erase the fill (its role is subsumed by acc_in thread).
+            rewriter.erase_op(fill)
+            # 3. Replace the load with fvreduce.result and erase it.
+            rewriter.replace_op(load, [], [fvreduce.result])
+            # 4. Erase the now-dead scratch alloca.
+            if alloca_op is not None and not alloca_op.memref.uses:
+                rewriter.erase_op(alloca_op)
+        else:
+            # Untiled case: emit a terminal store of the fvreduce result.
+            store = memref.StoreOp.get(fvreduce.result, out_val, [])
+            rewriter.replace_matched_op([*extra_ops, fvreduce, store], [])
+            rewriter.erase_op(fill)
+
+
+def _find_preceding_fill(
+    generic: linalg.GenericOp, out_val: SSAValue
+) -> linalg.FillOp | None:
+    """Walk backwards in the parent block for a linalg.fill writing out_val."""
+    cur = generic.prev_op
+    while cur is not None:
+        if isinstance(cur, linalg.FillOp):
+            for o in cur.outputs:
+                if o is out_val:
+                    return cur
+        cur = cur.prev_op
+    return None
+
+
+def _find_following_load(
+    generic: linalg.GenericOp, out_val: SSAValue
+) -> memref.LoadOp | None:
+    """Walk forwards in the parent block for a memref.load from out_val."""
+    cur = generic.next_op
+    while cur is not None:
+        if isinstance(cur, memref.LoadOp) and cur.memref is out_val:
+            return cur
+        cur = cur.next_op
+    return None
+
+
 @dataclass(frozen=True)
 class LinalgToNpuPass(ModulePass):
     """Lower linalg.generic ops on memrefs to NPU dialect operations."""
@@ -213,5 +359,7 @@ class LinalgToNpuPass(ModulePass):
 
     def apply(self, ctx: Context, op: ModuleOp) -> None:
         PatternRewriteWalker(
-            GreedyRewritePatternApplier([LinalgElementwiseToNpuPattern()])
+            GreedyRewritePatternApplier(
+                [LinalgElementwiseToNpuPattern(), LinalgReductionToNpuPattern()]
+            )
         ).rewrite_module(op)

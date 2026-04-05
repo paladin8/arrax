@@ -5,7 +5,7 @@ from __future__ import annotations
 from xdsl.context import Context
 from xdsl.dialects.builtin import ModuleOp
 
-from arrax.dsl.array import Array, exp, relu
+from arrax.dsl.array import Array, exp, relu, sum
 
 from arrax.lowering.array_to_linalg import ArrayToLinalgPass
 from arrax.lowering.bufferize import BufferizePass
@@ -250,6 +250,79 @@ builtin.module {
         ir = str(module)
         assert "npu.fvdiv" in ir
         assert "linalg.generic" not in ir
+
+    # --- reduction lowering (sum) ---
+
+    def test_sum_untiled_basic(self) -> None:
+        """sum(A), n=64 (untiled): alloca+fill+generic collapse to fvreduce + store."""
+        module = make_module(lambda A: sum(A), {"A": (64,)})
+        _lower_to_npu(module)
+        ir = str(module)
+        assert "npu.fvreduce" in ir
+        assert "linalg.generic" not in ir
+        assert "linalg.fill" not in ir
+        assert "memref.store" in ir  # terminal rank-0 store
+        assert "-> f32" in ir
+        # N is materialized as a constant since the input is a static memref
+        assert "arith.constant 64 : index" in ir
+
+    def test_sum_untiled_small(self) -> None:
+        module = make_module(lambda A: sum(A), {"A": (16,)})
+        _lower_to_npu(module)
+        ir = str(module)
+        assert "npu.fvreduce" in ir
+        assert "linalg.generic" not in ir
+        assert "arith.constant 16 : index" in ir
+
+    def test_sum_untiled_acc_is_zero(self) -> None:
+        """Untiled reduction threads acc_in = arith.constant 0.0."""
+        module = make_module(lambda A: sum(A), {"A": (32,)})
+        _lower_to_npu(module)
+        ir = str(module)
+        assert "arith.constant 0.000000e+00 : f32" in ir
+        assert "npu.fvreduce" in ir
+
+    def test_sum_tiled_basic(self) -> None:
+        """sum(A), n=128: fvreduce inside scf.for body, load/alloca erased."""
+        module = make_module(lambda A: sum(A), {"A": (128,)})
+        _lower_to_npu_with_tiling(module)
+        ir = str(module)
+        assert "npu.fvreduce" in ir
+        assert "scf.for" in ir
+        assert "iter_args" in ir
+        assert "linalg.generic" not in ir
+        assert "linalg.fill" not in ir
+        assert "memref.alloca" not in ir
+        assert "memref.load" not in ir
+        assert "memref.store" in ir  # terminal write outside loop
+        # The chunk size comes from arith.minsi inside the loop
+        assert "arith.minsi" in ir
+
+    def test_sum_tiled_non_multiple(self) -> None:
+        """sum(A), n=100: fvreduce tolerates the remainder chunk."""
+        module = make_module(lambda A: sum(A), {"A": (100,)})
+        _lower_to_npu_with_tiling(module)
+        ir = str(module)
+        assert "npu.fvreduce" in ir
+        assert "scf.for" in ir
+        assert "linalg.generic" not in ir
+        assert "memref.alloca" not in ir
+
+    def test_sum_tiled_large(self) -> None:
+        """sum(A), n=1024."""
+        module = make_module(lambda A: sum(A), {"A": (1024,)})
+        _lower_to_npu_with_tiling(module)
+        ir = str(module)
+        assert "npu.fvreduce" in ir
+        assert "scf.for" in ir
+        assert "linalg.generic" not in ir
+
+    def test_sum_verifies(self) -> None:
+        """Verifier passes for both tiled and untiled sum."""
+        for n in (16, 64, 100, 128, 1024):
+            module = make_module(lambda A: sum(A), {"A": (n,)})
+            _lower_to_npu_with_tiling(module)
+            module.verify()
 
     def test_tiled_no_arith_constant_for_n(self) -> None:
         """After tiling, n comes from minsi — no new arith.constant for element count."""

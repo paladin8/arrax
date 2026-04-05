@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from arrax.dsl.array import Array
+from arrax.dsl.array import Array, sum
 from arrax.dsl.tracer import trace
 from arrax.lowering.dsl_to_array import dsl_to_array
 from tests.helpers import make_module
@@ -78,3 +78,22 @@ builtin.module {
 
         with pytest.raises(ValueError, match="unsupported operation: unknown"):
             dsl_to_array(bad, ["A", "B"], {"A": (10,), "B": (10,)})
+
+    def test_sum_rank0_result(self) -> None:
+        """sum(A) produces array.sum with a rank-0 tensor<f32> result."""
+        module = make_module(lambda A: sum(A), {"A": (128,)})
+        module.verify()
+        ir = str(module)
+        assert "array.sum" in ir
+        assert "tensor<128xf32> -> tensor<f32>" in ir
+        assert "func.func @kernel(%0: tensor<128xf32>) -> tensor<f32>" in ir
+
+    def test_sum_of_add(self) -> None:
+        """sum(A + B) produces array.add followed by array.sum."""
+        module = make_module(
+            lambda A, B: sum(A + B), {"A": (64,), "B": (64,)}
+        )
+        module.verify()
+        ir = str(module)
+        assert "array.add" in ir
+        assert "array.sum" in ir

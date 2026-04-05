@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from arrax.dsl.array import Array
+from arrax.dsl.array import Array, sum
 from arrax.dsl.tracer import trace
 
 
@@ -68,3 +68,21 @@ class TestTrace:
         assert result.op == "add"
         assert result.operands[0].name == "A"
         assert result.operands[1].name == "B"
+
+    def test_trace_sum(self) -> None:
+        """sum(A) produces a rank-0 root node."""
+        result, params = trace(lambda A: sum(A), {"A": (128,)})
+        assert params == ["A"]
+        assert result.op == "sum"
+        assert result.shape == ()
+        assert result.operands[0].is_leaf
+        assert result.operands[0].name == "A"
+
+    def test_trace_sum_of_add(self) -> None:
+        """sum(A + B) produces a two-level DAG with a rank-0 root."""
+        result, params = trace(lambda A, B: sum(A + B), {"A": (64,), "B": (64,)})
+        assert params == ["A", "B"]
+        assert result.op == "sum"
+        assert result.shape == ()
+        inner = result.operands[0]
+        assert inner.op == "add"

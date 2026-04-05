@@ -65,3 +65,15 @@ def exp(x: Array) -> Array:
     result.op = "exp"
     result.operands = [x]
     return result
+
+
+def sum(x: Array) -> Array:
+    """Sum-reduction across all elements. Returns a rank-0 Array.
+
+    Reductions must be the compiled function's return value (terminal).
+    A non-terminal use raises at compile time.
+    """
+    result = Array(name="", shape=())
+    result.op = "sum"
+    result.operands = [x]
+    return result

@@ -15,7 +15,9 @@ from xdsl.irdl import (
     ParsePropInAttrDict,
     irdl_op_definition,
     operand_def,
+    opt_prop_def,
     prop_def,
+    result_def,
 )
 from xdsl.utils.exceptions import VerifyException
 
@@ -347,6 +349,78 @@ class FVDivOp(IRDLOperation):
                     )
 
 
+@irdl_op_definition
+class FVReduceOp(IRDLOperation):
+    """Chunk sum reduction: result = acc_in + sum(src[0..n]).
+
+    Maps to NPU.FVREDUCE (opcode=0x2B, funct7=0x05) followed by fadd.s
+    with the prior accumulator.
+
+    The scalar accumulator is threaded through SSA (not a rank-0 memref) so
+    it stays in an FP register across loop iterations.
+
+    An optional `divisor` property encodes mean semantics: when set, the asm
+    emitter emits a trailing `fdiv.s result, result, divisor` after the
+    reduction loop closes.
+    """
+
+    name = "npu.fvreduce"
+
+    src = operand_def(MemRefType)
+    n = operand_def(IndexType)
+    acc_in = operand_def(Float32Type)
+    result = result_def(Float32Type)
+
+    divisor = opt_prop_def(IntegerAttr)
+
+    irdl_options = (ParsePropInAttrDict(),)
+
+    assembly_format = (
+        "$src `,` $n `,` $acc_in attr-dict"
+        " `:` type($src) `,` type($n) `,` type($acc_in) `->` type($result)"
+    )
+
+    def __init__(
+        self,
+        src: SSAValue | Operation,
+        n: SSAValue | Operation,
+        acc_in: SSAValue | Operation,
+        divisor: int | None = None,
+    ) -> None:
+        properties: dict[str, object] = {}
+        if divisor is not None:
+            properties["divisor"] = IntegerAttr(divisor, 64)
+        super().__init__(
+            operands=[src, n, acc_in],
+            result_types=[Float32Type()],
+            properties=properties,
+        )
+
+    def verify_(self) -> None:
+        src_type = self.src.type
+        assert isinstance(src_type, MemRefType)
+        if len(src_type.get_shape()) != 1:
+            raise VerifyException(
+                f"npu.fvreduce: src must be a rank-1 memref, got shape "
+                f"{src_type.get_shape()}"
+            )
+        if not isinstance(src_type.element_type, Float32Type):
+            raise VerifyException(
+                f"npu.fvreduce: expected f32 element type, got {src_type.element_type}"
+            )
+        if isinstance(self.n.owner, arith.ConstantOp):
+            n_attr = self.n.owner.value
+            if isinstance(n_attr, IntegerAttr):
+                n_val = n_attr.value.data
+                if n_val > NPU_MAX_VEC_LEN:
+                    raise VerifyException(
+                        f"npu.fvreduce: n={n_val} exceeds NPU vector length "
+                        f"limit ({NPU_MAX_VEC_LEN})"
+                    )
+
+
 NPUDialect = Dialect(
-    "npu", [FVAddOp, FVSubOp, FVReluOp, FVExpOp, FVMulOp, FVDivOp], []
+    "npu",
+    [FVAddOp, FVSubOp, FVReluOp, FVExpOp, FVMulOp, FVDivOp, FVReduceOp],
+    [],
 )

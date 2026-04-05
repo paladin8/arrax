@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from arrax.dsl.array import Array, exp, relu
+from arrax.dsl.array import sum as arr_sum
 from tests.helpers import fuse, make_module, tile
 
 
@@ -56,6 +57,23 @@ class TestFusion:
         ir = str(module)
         assert ir.count("scf.for") == 1
         assert ir.count("linalg.generic") == 1
+
+    def test_parallel_reduction_not_fused(self) -> None:
+        """sum(A + B) at N > 64: an iter_args-free parallel loop must NOT
+        fuse with an iter_args-carrying reduction loop. Parallel→reduction
+        fusion is Phase 5 work; Phase 1 must leave the two loops intact
+        rather than merging them and dropping the reduction yield.
+        """
+        module = make_module(
+            lambda A, B: arr_sum(A + B), {"A": (128,), "B": (128,)}
+        )
+        fuse(module)
+        module.verify()
+        ir = str(module)
+        # Two loops remain: one parallel (A+B) and one reduction (sum).
+        assert ir.count("scf.for") == 2
+        # The reduction loop still carries its iter_args.
+        assert "iter_args" in ir
 
     def test_cse_deduplicates_subi_minsi(self) -> None:
         """After fusion, redundant subi/minsi pairs are eliminated."""

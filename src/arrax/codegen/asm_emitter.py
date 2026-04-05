@@ -5,8 +5,9 @@ Walks NPU-dialect IR and emits a complete .S file with:
 - Copy loops for npu.fvadd in-place semantics (src2 -> dst)
 - .insn r directives for NPU instructions
 - .comm directives for intermediate buffer allocations
-- scf.for loops for tiled operations
+- scf.for loops (with or without iter_args) for tiled operations
 - memref.subview pointer arithmetic
+- npu.fvreduce handler for rank-0 reductions
 
 Register allocation strategy:
 - a0-a7: function arguments (RISC-V calling convention)
@@ -14,6 +15,9 @@ Register allocation strategy:
   memref.alloc addresses, loop IVs, memref.subview pointers
 - t4-t5: loop-body-local values (arith.subi, arith.minsi) — reset each iteration
 - t0-t3: scratch for copy loops, constant loading, .insn operands
+- fs0-fs11: scalar FP SSA values (reduction accumulators, iter_args) managed
+  by ScalarFPRegisterPool
+- ft0, ft1: ephemeral FP scratch for .insn destinations, constant materialization
 """
 
 from __future__ import annotations
@@ -21,7 +25,13 @@ from __future__ import annotations
 import struct
 
 from xdsl.dialects import arith, func, memref, scf
-from xdsl.dialects.builtin import IntegerAttr, MemRefType, ModuleOp
+from xdsl.dialects.builtin import (
+    Float32Type,
+    FloatAttr,
+    IntegerAttr,
+    MemRefType,
+    ModuleOp,
+)
 from xdsl.ir import Block, Operation, SSAValue
 
 from arrax.dialects.npu_dialect import (
@@ -29,6 +39,7 @@ from arrax.dialects.npu_dialect import (
     FVDivOp,
     FVExpOp,
     FVMulOp,
+    FVReduceOp,
     FVReluOp,
     FVSubOp,
 )
@@ -36,6 +47,98 @@ from arrax.dialects.npu_dialect import (
 # t-registers for loop-body-local values that die before the copy loop.
 # t0-t3 are reserved as scratch for copy loops and constant loading.
 _LOOP_BODY_T_REGS = ["t4", "t5"]
+
+# Scalar FP register pool: RISC-V callee-saved FP registers fs0-fs11.
+_SCALAR_FP_POOL = [f"fs{i}" for i in range(12)]
+
+
+class ScalarFPRegisterPool:
+    """Manages fs0-fs11 allocation for f32 SSA values that persist across ops.
+
+    Used for reduction accumulators, iter_args, and any f32 scalar that must
+    stay live across multiple emitted ops (including entire loop bodies).
+    Ephemeral scratch FP registers used inside a single op emission routine
+    (e.g., ``ft0`` for FVREDUCE's immediate destination) are NOT managed here.
+    """
+
+    def __init__(self) -> None:
+        self._free: list[str] = list(_SCALAR_FP_POOL)
+        self._map: dict[int, str] = {}
+
+    def allocate(self, val: SSAValue) -> str:
+        """Allocate the next free fs-register for ``val`` and return its name."""
+        if not self._free:
+            raise ValueError(
+                "asm_emitter: scalar FP register pool exhausted "
+                f"(all of {_SCALAR_FP_POOL} in use)"
+            )
+        reg = self._free.pop(0)
+        self._map[id(val)] = reg
+        return reg
+
+    def bind(self, val: SSAValue, reg: str) -> None:
+        """Alias an already-allocated ``reg`` to another SSA value.
+
+        Used for iter_args threading where a loop yield's SSA value must
+        share the same register as its corresponding iter_arg.
+        """
+        assert reg in _SCALAR_FP_POOL, (
+            f"ScalarFPRegisterPool.bind: {reg!r} is not a pooled register"
+        )
+        self._map[id(val)] = reg
+
+    def get(self, val: SSAValue) -> str:
+        return self._map[id(val)]
+
+    def contains(self, val: SSAValue) -> bool:
+        return id(val) in self._map
+
+    def release(self, val: SSAValue) -> None:
+        """Drop ``val``'s binding from the map; return the register to the
+        free list only once every aliased SSA value has been released.
+
+        A register may be aliased (via :meth:`bind`) to multiple SSA values —
+        for instance, an ``scf.for`` iter_arg body-arg and its matching
+        loop-result share a register. This method unconditionally removes
+        ``val``'s entry; the register returns to the free list only if no
+        other SSA value in the map still references it. Callers that need
+        to look up the target register for a yielded value must query the
+        surviving alias (e.g. ``parent.results[i]``), not the released one.
+        """
+        reg = self._map.pop(id(val), None)
+        if reg is None:
+            return
+        # If any other SSA value still maps to this register, it remains held.
+        if reg in self._map.values():
+            return
+        if reg not in self._free:
+            # LIFO: the just-released register is reused next.
+            self._free.insert(0, reg)
+
+
+def compute_last_use(root_block: Block) -> dict[int, int]:
+    """Forward walk that returns ``{id(SSAValue): last_op_index}`` per value.
+
+    Op indices number every op in IR order including ops inside nested
+    regions. A value's last-use index is the largest op index at which it
+    appears as an operand. Definitions that are never used do not appear
+    in the map.
+    """
+    last_use: dict[int, int] = {}
+    idx = [0]
+
+    def visit(block: Block) -> None:
+        for op in block.ops:
+            cur = idx[0]
+            idx[0] += 1
+            for operand in op.operands:
+                last_use[id(operand)] = cur
+            for region in op.regions:
+                for sub in region.blocks:
+                    visit(sub)
+
+    visit(root_block)
+    return last_use
 
 
 def emit_assembly(module: ModuleOp) -> str:
@@ -53,9 +156,13 @@ class _AsmEmitter:
         self._bss: list[str] = []
         self._reg_map: dict[int, str] = {}  # id(SSAValue) -> register name
         self._const_map: dict[int, int] = {}  # id(SSAValue) -> integer value
+        self._fconst_map: dict[int, int] = {}  # id(SSAValue) -> f32 IEEE bits
         self._s_reg_count: int = 0
         self._label_count: int = 0
         self._loop_t_reg_idx: int = 0  # index into _LOOP_BODY_T_REGS
+        self._fp_pool: ScalarFPRegisterPool = ScalarFPRegisterPool()
+        self._last_use: dict[int, int] = {}
+        self._op_index: int = 0
 
     def get_output(self) -> str:
         result = "\n".join(self._lines) + "\n"
@@ -150,6 +257,12 @@ class _AsmEmitter:
         for i, arg in enumerate(block.args):
             self._reg_map[id(arg)] = f"a{i}"
 
+        # Fresh per-function state for the scalar FP register pool and
+        # last-use table. Op indices number every op in visit order.
+        self._fp_pool = ScalarFPRegisterPool()
+        self._last_use = compute_last_use(block)
+        self._op_index = 0
+
         # Count s-registers needed (max concurrent)
         num_s_regs = self._count_s_regs_in_block(block)
 
@@ -173,6 +286,10 @@ class _AsmEmitter:
 
     def _emit_op(self, op: object) -> None:
         """Dispatch to the appropriate emission method for an op."""
+        # Record visit order for last-use bookkeeping.
+        cur_idx = self._op_index
+        self._op_index += 1
+
         if isinstance(op, arith.ConstantOp):
             self._emit_constant(op)
         elif isinstance(op, memref.AllocOp):
@@ -189,25 +306,57 @@ class _AsmEmitter:
             self._emit_fv_scalar_op(op, "FVMUL", 0x04)
         elif isinstance(op, FVDivOp):
             self._emit_fv_scalar_op(op, "FVDIV", 0x0B)
+        elif isinstance(op, FVReduceOp):
+            self._emit_fv_reduce(op)
         elif isinstance(op, scf.ForOp):
             self._emit_for(op)
         elif isinstance(op, memref.SubviewOp):
             self._emit_subview(op)
+        elif isinstance(op, memref.StoreOp):
+            self._emit_store(op)
         elif isinstance(op, arith.SubiOp):
             self._emit_subi(op)
         elif isinstance(op, arith.MinSIOp):
             self._emit_minsi(op)
         elif isinstance(op, scf.YieldOp):
-            pass  # no-op for loops without iter_args
+            self._emit_yield(op)
         elif isinstance(op, Operation):
             raise ValueError(f"asm_emitter: unsupported op {op.name}")
         else:
             raise ValueError(f"asm_emitter: unsupported op {type(op)}")
 
+        # Release any scalar FP register whose last use is this op.
+        self._release_dead_fp_regs(op, cur_idx)
+
+    def _release_dead_fp_regs(self, op: object, cur_idx: int) -> None:
+        """Free any pooled fs-register whose final use was this op."""
+        if not isinstance(op, Operation):
+            return
+        for operand in op.operands:
+            if not self._fp_pool.contains(operand):
+                continue
+            if self._last_use.get(id(operand)) == cur_idx:
+                self._fp_pool.release(operand)
+
     def _emit_constant(self, op: arith.ConstantOp) -> None:
-        """Record constant value for later use (emitted inline when needed)."""
-        assert isinstance(op.value, IntegerAttr)
-        self._const_map[id(op.result)] = op.value.value.data
+        """Record constant value for later use (emitted inline when needed).
+
+        Integer constants go into ``_const_map``. Float constants get their
+        IEEE bits stored in ``_fconst_map`` — materialization happens on
+        demand at the first use site (e.g. as an ``iter_args`` init).
+        """
+        if isinstance(op.value, IntegerAttr):
+            self._const_map[id(op.result)] = op.value.value.data
+        elif isinstance(op.value, FloatAttr) and isinstance(
+            op.value.type, Float32Type
+        ):
+            fval = op.value.value.data
+            bits = struct.unpack("<I", struct.pack("<f", fval))[0]
+            self._fconst_map[id(op.result)] = bits
+        else:
+            raise ValueError(
+                f"asm_emitter: unsupported constant type {op.value}"
+            )
 
     def _emit_alloc(self, op: memref.AllocOp) -> None:
         """Emit .comm for static buffer allocation, load address into s-register."""
@@ -226,7 +375,19 @@ class _AsmEmitter:
         self._reg_map[id(op.memref)] = sreg
 
     def _emit_for(self, op: scf.ForOp) -> None:
-        """Emit a counted loop for scf.for."""
+        """Emit a counted loop for scf.for, with optional f32 iter_args.
+
+        For each iter_arg:
+        - Allocate one fs-register from the scalar FP pool
+        - Materialize the init operand into it before the loop label
+        - Bind the body block arg to the same fs-register
+        - Bind the corresponding scf.for result to the same fs-register too
+          (post-loop uses read from it directly)
+
+        The yield operand's value must already live in the iter_arg's fs
+        register when the yield executes; reduction op emitters enforce
+        this by writing into the bound fs-register directly.
+        """
         body = op.body.blocks.first
         assert body is not None
 
@@ -236,6 +397,18 @@ class _AsmEmitter:
         # Assign IV to an s-register (persists across iterations)
         iv_reg = self._alloc_s_reg()
         self._reg_map[id(body.args[0])] = iv_reg
+
+        # --- iter_args handling ---
+        iter_arg_regs: list[str] = []
+        # body.args[0] is the IV; iter_args begin at index 1.
+        for i, init_val in enumerate(op.iter_args):
+            body_arg = body.args[i + 1]
+            fp_reg = self._fp_pool.allocate(body_arg)
+            iter_arg_regs.append(fp_reg)
+            # The loop result (read after the loop) reads from the same reg.
+            self._fp_pool.bind(op.results[i], fp_reg)
+            # Materialize init value into the register before the loop.
+            self._materialize_f32_into(init_val, fp_reg)
 
         # Initialize IV from lower bound
         if id(op.lb) in self._const_map and self._const_map[id(op.lb)] == 0:
@@ -280,6 +453,113 @@ class _AsmEmitter:
 
         # Restore s-reg counter for sequential loop reuse
         self._s_reg_count = loop_s_reg_start
+
+    def _materialize_f32_into(self, val: SSAValue, fp_reg: str) -> None:
+        """Load the f32 value ``val`` into ``fp_reg`` (callee-saved or scratch).
+
+        Supports f32 arith.constant (tracked in ``_fconst_map``) and already-
+        pooled scalars (emits ``fmv.s`` aliasing).
+        """
+        if id(val) in self._fconst_map:
+            bits = self._fconst_map[id(val)]
+            self._lines.append(f"    li t0, {bits}")
+            self._lines.append(f"    fmv.w.x {fp_reg}, t0")
+            return
+        if self._fp_pool.contains(val):
+            src = self._fp_pool.get(val)
+            if src != fp_reg:
+                self._lines.append(f"    fmv.s {fp_reg}, {src}")
+            return
+        raise ValueError(
+            f"asm_emitter: cannot materialize f32 SSA value into {fp_reg}"
+        )
+
+    def _emit_yield(self, op: scf.YieldOp) -> None:
+        """For loops with iter_args, ensure yielded f32 values land in the
+        iter_arg's pooled register. Reduction ops write directly into it,
+        so this is typically a no-op; guard against the alias mismatch case
+        where the yielded value is a different SSA (e.g., a bare constant).
+
+        Resolution of the target register goes through ``parent.results[i]``
+        rather than the body arg. Both are bound to the same pool register
+        during ``_emit_for``, but the body arg may already have been released
+        by ``_release_dead_fp_regs`` once its final in-body operand use has
+        passed — so looking it up there would miss.
+        """
+        parent = op.parent_op()
+        if not isinstance(parent, scf.ForOp):
+            return
+        for i, yield_val in enumerate(op.operands):
+            if not isinstance(yield_val.type, Float32Type):
+                continue
+            target_reg = self._fp_pool.get(parent.results[i])
+            if self._fp_pool.contains(yield_val):
+                src_reg = self._fp_pool.get(yield_val)
+                if src_reg != target_reg:
+                    self._lines.append(f"    fmv.s {target_reg}, {src_reg}")
+            else:
+                # Yielded value must be materializable (e.g. an f32 constant).
+                self._materialize_f32_into(yield_val, target_reg)
+
+    def _emit_fv_reduce(self, op: FVReduceOp) -> None:
+        """Emit NPU.FVREDUCE + fadd.s into the pooled accumulator register.
+
+        The ``acc_in`` SSA value already lives in an fs-register (either an
+        iter_args reg inside a loop or a freshly-materialized constant
+        outside). The ``result`` SSA value is bound to the SAME register,
+        so subsequent ops read the updated accumulator without extra moves.
+        """
+        src = self._reg(op.src)
+
+        # Acc_in comes either from an iter_arg (already in the pool) or a
+        # bare f32 constant (e.g. untiled N<=64 case); for the latter we
+        # must allocate a pool register and materialize it now. Do this
+        # BEFORE loading n into t0: materialization uses t0 as a scratch
+        # for the IEEE bits and would otherwise clobber the loaded n.
+        if self._fp_pool.contains(op.acc_in):
+            acc_reg = self._fp_pool.get(op.acc_in)
+        else:
+            acc_reg = self._fp_pool.allocate(op.acc_in)
+            self._materialize_f32_into(op.acc_in, acc_reg)
+        # The result SSA value aliases the accumulator register in-place.
+        self._fp_pool.bind(op.result, acc_reg)
+
+        # Resolve n: either a constant (static shape) or a known register.
+        n_is_const = id(op.n) in self._const_map
+        if n_is_const:
+            self._lines.append(f"    li t0, {self._const(op.n)}")
+            n_reg = "t0"
+        else:
+            n_reg = self._reg(op.n)
+
+        self._lines.append(f"    # NPU.FVREDUCE ft0 = sum({src}[0..{n_reg}])")
+        # FVREDUCE funct7 = 0x05; rd = ft0 (ephemeral), rs1 = src, rs2 = n.
+        self._lines.append(
+            f"    .insn r 0x2B, 0x0, 0x05, ft0, {src}, {n_reg}"
+        )
+        # Combine the per-call partial into the running accumulator.
+        self._lines.append(f"    fadd.s {acc_reg}, {acc_reg}, ft0")
+
+    def _emit_store(self, op: memref.StoreOp) -> None:
+        """Emit a rank-0 f32 store: ``fsw <val>, 0(<base>)``.
+
+        Only rank-0 stores are supported in M3 (the terminal write of a
+        reduction result). Other memref.store shapes are not produced by
+        the pipeline.
+        """
+        if op.indices:
+            raise ValueError(
+                "asm_emitter: only rank-0 memref.store is supported in M3"
+            )
+        val = op.value
+        ref = op.memref
+        if not isinstance(val.type, Float32Type):
+            raise ValueError(
+                f"asm_emitter: memref.store expected f32 value, got {val.type}"
+            )
+        val_reg = self._fp_pool.get(val)
+        base_reg = self._reg(ref)
+        self._lines.append(f"    fsw {val_reg}, 0({base_reg})")
 
     def _emit_subview(self, op: memref.SubviewOp) -> None:
         """Emit pointer arithmetic for a 1D subview: base + offset * 4.

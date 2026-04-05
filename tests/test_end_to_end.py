@@ -9,6 +9,7 @@ from riscv_npu import Emulator
 
 from arrax.codegen.build import build_elf
 from arrax.dsl.array import Array, exp, relu
+from arrax.dsl.array import sum as arr_sum
 from arrax.pipeline import compile_to_asm
 
 
@@ -32,6 +33,27 @@ def _compile_and_run(
     n = shapes[param_names[0]][0]
     actual = emu.read_f32("out", n)
     return actual, result.cycles
+
+
+def _compile_and_run_scalar(
+    fn,
+    shapes: dict[str, tuple[int, ...]],
+    inputs: dict[str, np.ndarray],
+    tmp_path: Path,
+) -> tuple[float, int]:
+    """Compile fn, build ELF, run on emulator, return a single f32 output."""
+    asm, param_names = compile_to_asm(fn, shapes)
+    elf_path = build_elf(asm, param_names, shapes, output_dir=tmp_path)
+
+    emu = Emulator()
+    emu.load_elf(str(elf_path))
+    for name, data in inputs.items():
+        emu.write_f32(name, data)
+    result = emu.run()
+    assert result.exit_code == 0
+
+    actual = emu.read_f32("out", 1)
+    return float(actual[0]), result.cycles
 
 
 class TestEndToEnd:
@@ -436,6 +458,81 @@ class TestEndToEnd:
             tmp_path,
         )
         np.testing.assert_allclose(actual, expected, rtol=1e-6)
+
+    def test_sum_small(self, tmp_path: Path) -> None:
+        """sum(A) with N=16: untiled rank-0 reduction."""
+        N = 16
+        A = np.arange(N, dtype=np.float32)
+        expected = float(A.sum())
+
+        actual, _ = _compile_and_run_scalar(
+            lambda A: arr_sum(A),
+            {"A": (N,)},
+            {"A": A},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-5)
+
+    def test_sum_exact_tile(self, tmp_path: Path) -> None:
+        """sum(A) with N=64: exact one-tile untiled reduction."""
+        N = 64
+        A = np.linspace(-1.0, 1.0, N, dtype=np.float32)
+        expected = float(A.sum())
+
+        actual, _ = _compile_and_run_scalar(
+            lambda A: arr_sum(A),
+            {"A": (N,)},
+            {"A": A},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-5)
+
+    def test_sum_non_multiple(self, tmp_path: Path) -> None:
+        """sum(A) with N=100: tiled reduction with remainder chunk."""
+        N = 100
+        A = np.arange(N, dtype=np.float32) * 0.1
+        expected = float(A.sum())
+
+        actual, _ = _compile_and_run_scalar(
+            lambda A: arr_sum(A),
+            {"A": (N,)},
+            {"A": A},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-5)
+
+    def test_sum_of_add(self, tmp_path: Path) -> None:
+        """sum(A + B) at N=128: exercises a parallel elementwise loop
+        followed by a reduction loop in the same kernel. Phase 1 must NOT
+        fuse these (fusion safety guard), and the end-to-end result must
+        still match NumPy.
+        """
+        N = 128
+        A = np.arange(N, dtype=np.float32)
+        B = np.ones(N, dtype=np.float32) * 0.5
+        expected = float((A + B).sum())
+
+        actual, _ = _compile_and_run_scalar(
+            lambda A, B: arr_sum(A + B),
+            {"A": (N,), "B": (N,)},
+            {"A": A, "B": B},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-5)
+
+    def test_sum_large(self, tmp_path: Path) -> None:
+        """sum(A) with N=1024: many tiled iterations threading fs0 iter_arg."""
+        N = 1024
+        A = np.ones(N, dtype=np.float32) * 0.5
+        expected = float(A.sum())
+
+        actual, _ = _compile_and_run_scalar(
+            lambda A: arr_sum(A),
+            {"A": (N,)},
+            {"A": A},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-4)
 
     def test_reports_cycles(self, tmp_path: Path) -> None:
         """Emulator reports nonzero cycle count."""

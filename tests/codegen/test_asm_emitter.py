@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import pytest
 from xdsl.context import Context
 from xdsl.dialects import arith, func
 from xdsl.dialects.builtin import (
     Float32Type,
+    FloatAttr,
     IndexType,
     IntegerAttr,
     MemRefType,
@@ -13,9 +15,13 @@ from xdsl.dialects.builtin import (
 )
 from xdsl.ir import Block, Region
 
-from arrax.codegen.asm_emitter import emit_assembly
+from arrax.codegen.asm_emitter import (
+    ScalarFPRegisterPool,
+    compute_last_use,
+    emit_assembly,
+)
 from arrax.dialects.npu_dialect import FVAddOp, FVSubOp
-from arrax.dsl.array import Array, exp, relu
+from arrax.dsl.array import Array, exp, relu, sum
 from arrax.lowering.array_to_linalg import ArrayToLinalgPass
 from arrax.lowering.bufferize import BufferizePass
 from arrax.lowering.linalg_to_npu import LinalgToNpuPass
@@ -345,3 +351,239 @@ kernel:
         asm = _to_asm_tiled(module)
         assert ".Lfor_" in asm
         assert ".insn r 0x2B, 0x0, 0x09" in asm
+
+    # --- sum reduction ---
+
+    def test_sum_untiled(self) -> None:
+        """sum(A), N=64: FVREDUCE .insn + fadd.s into fs0 + fsw terminal store."""
+        module = make_module(lambda A: sum(A), {"A": (64,)})
+        asm = _to_asm_tiled(module)
+        # FVREDUCE funct7 = 0x05
+        assert ".insn r 0x2B, 0x0, 0x05" in asm
+        # Accumulator materialized into scalar FP register fs0
+        assert "fs0" in asm
+        # Identity seeding: 0.0 loaded into fs0 via li+fmv.w.x
+        assert "fmv.w.x fs0" in asm
+        # Combine the per-call partial into fs0
+        assert "fadd.s fs0, fs0" in asm
+        # Terminal store to the rank-0 output memref (a1)
+        assert "fsw fs0, 0(a1)" in asm
+
+    def test_sum_small(self) -> None:
+        module = make_module(lambda A: sum(A), {"A": (16,)})
+        asm = _to_asm_tiled(module)
+        assert ".insn r 0x2B, 0x0, 0x05" in asm
+        assert "fsw fs0, 0(a1)" in asm
+
+    def test_sum_untiled_n_not_clobbered_by_acc_materialization(self) -> None:
+        """Regression: untiled fvreduce must load n into t0 AFTER materializing
+        the f32 acc_in — otherwise the ``li t0, <f32 bits>`` emitted by
+        materialization overwrites the just-loaded element count.
+        """
+        module = make_module(lambda A: sum(A), {"A": (16,)})
+        asm = _to_asm_tiled(module)
+        # The last `li t0, ...` before the FVREDUCE .insn must load the
+        # element count (16), not the f32 bits for 0.0.
+        insn_idx = asm.index(".insn r 0x2B, 0x0, 0x05")
+        pre_insn = asm[:insn_idx]
+        last_li_t0 = pre_insn.rfind("li t0,")
+        assert last_li_t0 != -1
+        last_li_line = pre_insn[last_li_t0:].splitlines()[0]
+        assert "li t0, 16" in last_li_line, (
+            f"n clobbered before FVREDUCE; last li t0 before .insn was: "
+            f"{last_li_line!r}"
+        )
+
+    def test_sum_tiled_n_from_minsi_register(self) -> None:
+        """In the tiled case, FVREDUCE's n operand is the chunk size
+        produced by ``arith.minsi`` inside the loop body. It lives in a
+        loop-body t-register (not t0), so there is no scratch aliasing
+        with acc_in materialization — but the emission must actually
+        reference that register, not t0.
+        """
+        module = make_module(lambda A: sum(A), {"A": (128,)})
+        asm = _to_asm_tiled(module)
+        # The FVREDUCE emission is inside the loop body; its rs2 (n) must
+        # be a loop-body t-register (t4 or t5), not t0.
+        lines = asm.splitlines()
+        insn_lines = [line for line in lines if ".insn r 0x2B, 0x0, 0x05" in line]
+        assert len(insn_lines) == 1, f"expected one FVREDUCE, got {insn_lines}"
+        insn_line = insn_lines[0]
+        # rs2 is the last comma-separated operand on the line.
+        rs2 = insn_line.rsplit(",", 1)[1].strip()
+        assert rs2 in {"t4", "t5"}, (
+            f"tiled FVREDUCE n register should be a loop-body t-reg, got {rs2!r}"
+        )
+
+    def test_sum_tiled(self) -> None:
+        """sum(A), N=128: FVREDUCE inside scf.for; fs0 init before loop; fsw after."""
+        module = make_module(lambda A: sum(A), {"A": (128,)})
+        asm = _to_asm_tiled(module)
+        assert ".Lfor_" in asm
+        assert ".insn r 0x2B, 0x0, 0x05" in asm  # FVREDUCE
+        assert "fadd.s fs0, fs0" in asm
+        assert "fsw fs0, 0(a1)" in asm
+        # iter_args init (0.0) emitted before the loop label
+        pre_loop = asm.split(".Lfor_")[0]
+        assert "fmv.w.x fs0" in pre_loop
+        # Terminal store lives after the loop end label (last .Lfor_end
+        # occurrence is the label; earlier ones are branch targets).
+        post_loop = asm.split(".Lfor_end")[-1]
+        assert "fsw fs0, 0(a1)" in post_loop
+
+    def test_sum_non_multiple(self) -> None:
+        """sum(A), N=100: remainder tolerated by FVREDUCE inside tiled loop."""
+        module = make_module(lambda A: sum(A), {"A": (100,)})
+        asm = _to_asm_tiled(module)
+        assert ".Lfor_" in asm
+        assert ".insn r 0x2B, 0x0, 0x05" in asm
+        assert "fsw fs0, 0(a1)" in asm
+
+    def test_sum_large(self) -> None:
+        """sum(A), N=1024."""
+        module = make_module(lambda A: sum(A), {"A": (1024,)})
+        asm = _to_asm_tiled(module)
+        assert ".Lfor_" in asm
+        assert ".insn r 0x2B, 0x0, 0x05" in asm
+
+
+class TestScalarFPRegisterPool:
+    @staticmethod
+    def _mk() -> arith.ConstantOp:
+        return arith.ConstantOp(FloatAttr(0.0, Float32Type()))
+
+    def test_first_allocation_is_fs0(self) -> None:
+        pool = ScalarFPRegisterPool()
+        c = self._mk()
+        assert pool.allocate(c.result) == "fs0"
+
+    def test_two_live_scalars_get_distinct_registers(self) -> None:
+        pool = ScalarFPRegisterPool()
+        a = self._mk()
+        b = self._mk()
+        r1 = pool.allocate(a.result)
+        r2 = pool.allocate(b.result)
+        assert r1 != r2
+        assert pool.get(a.result) == r1
+        assert pool.get(b.result) == r2
+
+    def test_release_returns_register_to_pool(self) -> None:
+        pool = ScalarFPRegisterPool()
+        a = self._mk()
+        b = self._mk()
+        r1 = pool.allocate(a.result)
+        pool.release(a.result)
+        r2 = pool.allocate(b.result)
+        assert r1 == r2  # reused
+
+    def test_bind_aliases_existing_register(self) -> None:
+        """bind() maps a new SSA value to an already-allocated register."""
+        pool = ScalarFPRegisterPool()
+        a = self._mk()
+        b = self._mk()
+        r1 = pool.allocate(a.result)
+        pool.bind(b.result, r1)
+        assert pool.get(b.result) == r1
+
+    def test_release_after_bind_frees_when_all_aliases_gone(self) -> None:
+        """Regression: alias tracking must unconditionally pop each released
+        SSA value from the map and only free the underlying register once
+        every aliased reference has been dropped. Previously the release
+        path kept val's entry in the map while aliases existed, which
+        left neither alias ever reaching the 'sole holder' branch and
+        leaked the register permanently.
+        """
+        pool = ScalarFPRegisterPool()
+        a = self._mk()
+        b = self._mk()
+        c = self._mk()
+        r1 = pool.allocate(a.result)
+        pool.bind(b.result, r1)
+        # Drop one alias: register still held by b, must not be freed yet.
+        pool.release(a.result)
+        # Drop the other: register is now unreferenced and must return to
+        # the free list in LIFO order.
+        pool.release(b.result)
+        r2 = pool.allocate(c.result)
+        assert r1 == r2, (
+            f"expected {r1} to be reused after all aliases released, "
+            f"but got {r2}"
+        )
+
+    def test_lifo_reuse(self) -> None:
+        """Just-released registers are reused before lower-numbered ones."""
+        pool = ScalarFPRegisterPool()
+        a, b, c = self._mk(), self._mk(), self._mk()
+        r1 = pool.allocate(a.result)  # fs0
+        r2 = pool.allocate(b.result)  # fs1
+        pool.release(b.result)
+        r3 = pool.allocate(c.result)
+        assert r3 == r2  # fs1 comes back first, not fs2
+        assert r1 == "fs0"
+
+    def test_exhaustion_raises(self) -> None:
+        pool = ScalarFPRegisterPool()
+        # Allocate all 12 regs
+        for _ in range(12):
+            c = self._mk()
+            pool.allocate(c.result)
+        overflow = self._mk()
+        with pytest.raises(ValueError, match="scalar FP register pool"):
+            pool.allocate(overflow.result)
+
+
+class TestComputeLastUse:
+    def test_last_use_is_index_of_final_operand_reference(self) -> None:
+        """A value's last-use index equals the index of the last op that
+        references it as an operand, numbered in IR visit order.
+        """
+        # Build: c0 = const; c1 = const; s0 = addi c0, c1; s1 = subi s0, c0
+        # Visit order indices: c0=0, c1=1, s0=2, s1=3.
+        # Last uses: c0 -> 3 (operand of s1), c1 -> 2 (operand of s0),
+        # s0 -> 3 (operand of s1); s1 has no users.
+        c0 = arith.ConstantOp(IntegerAttr(10, IndexType()))
+        c1 = arith.ConstantOp(IntegerAttr(20, IndexType()))
+        s0 = arith.AddiOp(c0.result, c1.result)
+        s1 = arith.SubiOp(s0.result, c0.result)
+        block = Block()
+        block.add_ops([c0, c1, s0, s1])
+
+        lu = compute_last_use(block)
+        assert lu[id(c0.result)] == 3
+        assert lu[id(c1.result)] == 2
+        assert lu[id(s0.result)] == 3
+        assert id(s1.result) not in lu  # never used
+
+    def test_last_use_crosses_nested_regions(self) -> None:
+        """Ops inside a nested region are numbered in the same index sequence
+        as their enclosing block, so a value defined outside the region and
+        used inside it has its last-use at the inner op's index.
+        """
+        # Build: c0 = const; for-like op with body that references c0.
+        # We use scf.ForOp so the region walk in compute_last_use is real.
+        from xdsl.dialects import scf
+
+        lb = arith.ConstantOp(IntegerAttr(0, IndexType()))
+        ub = arith.ConstantOp(IntegerAttr(4, IndexType()))
+        step = arith.ConstantOp(IntegerAttr(1, IndexType()))
+        outer = arith.ConstantOp(IntegerAttr(42, IndexType()))
+
+        body_block = Block(arg_types=[IndexType()])
+        inner = arith.AddiOp(body_block.args[0], outer.result)
+        yield_op = scf.YieldOp()
+        body_block.add_ops([inner, yield_op])
+        for_op = scf.ForOp(
+            lb.result, ub.result, step.result, [], Region([body_block])
+        )
+
+        outer_block = Block()
+        outer_block.add_ops([lb, ub, step, outer, for_op])
+
+        lu = compute_last_use(outer_block)
+        # Visit order: lb=0, ub=1, step=2, outer=3, for_op=4, inner=5, yield=6
+        # outer.result is referenced by inner → last use = 5.
+        assert lu[id(outer.result)] == 5
+        # lb/ub/step last-used at for_op (index 4).
+        assert lu[id(lb.result)] == 4
+        assert lu[id(ub.result)] == 4
+        assert lu[id(step.result)] == 4

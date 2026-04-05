@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from arrax.dsl.array import Array
+from arrax.dsl.array import Array, sum
 from tests.helpers import bufferize, make_module, tile
 
 
@@ -72,6 +72,95 @@ class TestTile:
         module = make_module(lambda A, B: A + B, {"A": (100,), "B": (100,)})
         tile(module)
         module.verify()
+
+    # --- reduction tiling (sum) ---
+
+    def test_reduction_below_limit_unchanged(self) -> None:
+        """sum(A), n=32: untiled reduction passes through."""
+        expected = str(bufferize(make_module(lambda A: sum(A), {"A": (32,)})))
+
+        module = make_module(lambda A: sum(A), {"A": (32,)})
+        tile(module)
+        assert str(module) == expected
+
+    def test_reduction_at_limit_unchanged(self) -> None:
+        """sum(A), n=64: exactly at limit, no tiling."""
+        expected = str(bufferize(make_module(lambda A: sum(A), {"A": (64,)})))
+
+        module = make_module(lambda A: sum(A), {"A": (64,)})
+        tile(module)
+        assert str(module) == expected
+
+    def test_reduction_exact_multiple(self) -> None:
+        """sum(A), n=128: scf.for with f32 iter_args, inner alloca+fill+generic."""
+        module = make_module(lambda A: sum(A), {"A": (128,)})
+        tile(module)
+        ir = str(module)
+        assert "scf.for" in ir
+        assert "iter_args" in ir
+        # iter_args carries an f32 accumulator
+        assert "-> (f32)" in ir
+        assert "arith.minsi" in ir
+        # inner per-tile scratch allocated on the stack
+        assert "memref.alloca" in ir
+        # inner fill seeds scratch with current acc; inner generic runs reduction
+        assert "linalg.fill" in ir
+        assert "linalg.generic" in ir
+        assert '"reduction"' in ir
+        # load out of scratch + scf.yield f32
+        assert "memref.load" in ir
+        assert "scf.yield" in ir
+        # terminal store to rank-0 output after the loop
+        assert "memref.store" in ir
+        assert "memref<f32>" in ir  # the output arg
+
+    def test_reduction_non_multiple(self) -> None:
+        """sum(A), n=100: remainder handled via arith.minsi inside the loop."""
+        module = make_module(lambda A: sum(A), {"A": (100,)})
+        tile(module)
+        ir = str(module)
+        assert "scf.for" in ir
+        assert "iter_args" in ir
+        assert "arith.minsi" in ir
+        assert "memref.alloca" in ir
+        assert "linalg.fill" in ir
+        assert "memref.load" in ir
+
+    def test_reduction_large(self) -> None:
+        """sum(A), n=1024: 16 iterations over the reduction."""
+        module = make_module(lambda A: sum(A), {"A": (1024,)})
+        tile(module)
+        ir = str(module)
+        assert "scf.for" in ir
+        assert "iter_args" in ir
+        assert "arith.constant 64 : index" in ir
+        assert "arith.constant 1024 : index" in ir
+
+    def test_reduction_verifies(self) -> None:
+        """Tiled reduction IR passes xDSL verification."""
+        module = make_module(lambda A: sum(A), {"A": (100,)})
+        tile(module)
+        module.verify()
+
+    def test_reduction_single_store_outside_loop(self) -> None:
+        """Exactly one memref.store (terminal), and it is after the loop."""
+        module = make_module(lambda A: sum(A), {"A": (128,)})
+        tile(module)
+        ir = str(module)
+        assert ir.count("memref.store") == 1
+
+    def test_reduction_init_is_identity(self) -> None:
+        """iter_args init is the fill's 0.0 identity (sum), not a loop phi of an alloc."""
+        module = make_module(lambda A: sum(A), {"A": (128,)})
+        tile(module)
+        ir = str(module)
+        # The original linalg.fill writing to memref<f32> is gone — its
+        # identity moves into iter_args init.
+        assert "arith.constant 0.000000e+00 : f32" in ir
+        # No top-level linalg.fill over memref<f32> remains.
+        # (Inner alloca fill is memref<f32> too; check fill occurs only inside
+        # the loop body by ensuring there's exactly one fill after tiling.)
+        assert ir.count("linalg.fill") == 1
 
     def test_golden_128(self) -> None:
         """Golden-string snapshot for n=128."""
