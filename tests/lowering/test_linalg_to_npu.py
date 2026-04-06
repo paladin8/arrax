@@ -5,7 +5,7 @@ from __future__ import annotations
 from xdsl.context import Context
 from xdsl.dialects.builtin import ModuleOp
 
-from arrax.dsl.array import Array, amax, dot, exp, relu, sum
+from arrax.dsl.array import Array, amax, dot, exp, mean, relu, sum
 
 from arrax.lowering.array_to_linalg import ArrayToLinalgPass
 from arrax.lowering.bufferize import BufferizePass
@@ -451,5 +451,55 @@ builtin.module {
         """Verifier passes for both tiled and untiled dot."""
         for n in (16, 64, 100, 128, 1024):
             module = make_module(lambda A, B: dot(A, B), {"A": (n,), "B": (n,)})
+            _lower_to_npu_with_tiling(module)
+            module.verify()
+
+    # --- reduction lowering (mean) ---
+
+    def test_mean_untiled_basic(self) -> None:
+        """mean(A), n=64: produces npu.fvreduce with divisor property + store."""
+        module = make_module(lambda A: mean(A), {"A": (64,)})
+        _lower_to_npu(module)
+        ir = str(module)
+        assert "npu.fvreduce" in ir
+        assert "linalg.generic" not in ir
+        assert "linalg.fill" not in ir
+        assert "memref.store" in ir
+        assert "divisor = 64 : i64" in ir
+
+    def test_mean_untiled_small(self) -> None:
+        """mean(A), n=16: divisor matches input size."""
+        module = make_module(lambda A: mean(A), {"A": (16,)})
+        _lower_to_npu(module)
+        ir = str(module)
+        assert "npu.fvreduce" in ir
+        assert "divisor = 16 : i64" in ir
+
+    def test_mean_tiled_basic(self) -> None:
+        """mean(A), n=128: fvreduce inside scf.for with divisor property."""
+        module = make_module(lambda A: mean(A), {"A": (128,)})
+        _lower_to_npu_with_tiling(module)
+        ir = str(module)
+        assert "npu.fvreduce" in ir
+        assert "scf.for" in ir
+        assert "iter_args" in ir
+        assert "linalg.generic" not in ir
+        assert "linalg.fill" not in ir
+        assert "memref.alloca" not in ir
+        assert "divisor = 128 : i64" in ir
+
+    def test_mean_tiled_non_multiple(self) -> None:
+        """mean(A), n=100: remainder handled, divisor preserved."""
+        module = make_module(lambda A: mean(A), {"A": (100,)})
+        _lower_to_npu_with_tiling(module)
+        ir = str(module)
+        assert "npu.fvreduce" in ir
+        assert "scf.for" in ir
+        assert "divisor = 100 : i64" in ir
+
+    def test_mean_verifies(self) -> None:
+        """Verifier passes for both tiled and untiled mean."""
+        for n in (16, 64, 100, 128, 1024):
+            module = make_module(lambda A: mean(A), {"A": (n,)})
             _lower_to_npu_with_tiling(module)
             module.verify()

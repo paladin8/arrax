@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from arrax.dsl.array import Array, amax, dot, exp, relu, sum
+from arrax.dsl.array import Array, amax, dot, exp, mean, relu, sum
 from tests.helpers import lower_to_linalg, make_module
 
 
@@ -233,3 +233,22 @@ builtin.module {
         assert ir.count("linalg.generic") == 2
         assert '"parallel"' in ir
         assert '"reduction"' in ir
+
+    def test_mean_produces_sum_generic_with_divisor_attr(self) -> None:
+        """mean(A) lowers to a sum-shaped generic with arrax.mean_divisor attribute."""
+        module = make_module(lambda A: mean(A), {"A": (128,)})
+        lower_to_linalg(module)
+        ir = str(module)
+        assert "linalg.generic" in ir
+        assert '"reduction"' in ir
+        assert "arith.addf" in ir
+        assert "linalg.fill" in ir
+        # The divisor attribute is attached to the generic
+        assert "arrax.mean_divisor = 128 : i64" in ir
+
+    def test_mean_divisor_matches_input_size(self) -> None:
+        """arrax.mean_divisor value matches the input tensor dimension."""
+        module = make_module(lambda A: mean(A), {"A": (64,)})
+        lower_to_linalg(module)
+        ir = str(module)
+        assert "arrax.mean_divisor = 64 : i64" in ir

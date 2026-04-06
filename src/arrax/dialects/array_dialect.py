@@ -173,6 +173,28 @@ class DivScalarOp(IRDLOperation):
         )
 
 
+def _verify_rank1_to_rank0_f32(op_name: str, input_type: object, result_type: object) -> None:
+    """Shared verifier for unary reduction ops (rank-1 f32 -> rank-0 f32)."""
+    assert isinstance(input_type, TensorType)
+    assert isinstance(result_type, TensorType)
+    if len(input_type.get_shape()) != 1:
+        raise VerifyException(
+            f"{op_name}: input must be rank-1, got shape {input_type.get_shape()}"
+        )
+    if not isinstance(input_type.element_type, Float32Type):
+        raise VerifyException(
+            f"{op_name}: expected f32 element type, got {input_type.element_type}"
+        )
+    if len(result_type.get_shape()) != 0:
+        raise VerifyException(
+            f"{op_name}: result must be rank-0, got shape {result_type.get_shape()}"
+        )
+    if not isinstance(result_type.element_type, Float32Type):
+        raise VerifyException(
+            f"{op_name}: expected f32 result element type, got {result_type.element_type}"
+        )
+
+
 @irdl_op_definition
 class SumOp(IRDLOperation):
     """Sum reduction: result = sum(input[i] for i in range(n)).
@@ -195,26 +217,7 @@ class SumOp(IRDLOperation):
         super().__init__(operands=[input], result_types=[result_type])
 
     def verify_(self) -> None:
-        input_type = self.input.type
-        result_type = self.result.type
-        assert isinstance(input_type, TensorType)
-        assert isinstance(result_type, TensorType)
-        if len(input_type.get_shape()) != 1:
-            raise VerifyException(
-                f"array.sum: input must be rank-1, got shape {input_type.get_shape()}"
-            )
-        if not isinstance(input_type.element_type, Float32Type):
-            raise VerifyException(
-                f"array.sum: expected f32 element type, got {input_type.element_type}"
-            )
-        if len(result_type.get_shape()) != 0:
-            raise VerifyException(
-                f"array.sum: result must be rank-0, got shape {result_type.get_shape()}"
-            )
-        if not isinstance(result_type.element_type, Float32Type):
-            raise VerifyException(
-                f"array.sum: expected f32 result element type, got {result_type.element_type}"
-            )
+        _verify_rank1_to_rank0_f32(self.name, self.input.type, self.result.type)
 
 
 @irdl_op_definition
@@ -240,26 +243,7 @@ class AmaxOp(IRDLOperation):
         super().__init__(operands=[input], result_types=[result_type])
 
     def verify_(self) -> None:
-        input_type = self.input.type
-        result_type = self.result.type
-        assert isinstance(input_type, TensorType)
-        assert isinstance(result_type, TensorType)
-        if len(input_type.get_shape()) != 1:
-            raise VerifyException(
-                f"array.amax: input must be rank-1, got shape {input_type.get_shape()}"
-            )
-        if not isinstance(input_type.element_type, Float32Type):
-            raise VerifyException(
-                f"array.amax: expected f32 element type, got {input_type.element_type}"
-            )
-        if len(result_type.get_shape()) != 0:
-            raise VerifyException(
-                f"array.amax: result must be rank-0, got shape {result_type.get_shape()}"
-            )
-        if not isinstance(result_type.element_type, Float32Type):
-            raise VerifyException(
-                f"array.amax: expected f32 result element type, got {result_type.element_type}"
-            )
+        _verify_rank1_to_rank0_f32(self.name, self.input.type, self.result.type)
 
 
 @irdl_op_definition
@@ -320,8 +304,34 @@ class DotOp(IRDLOperation):
             )
 
 
+@irdl_op_definition
+class MeanOp(IRDLOperation):
+    """Mean reduction: result = sum(input[i] for i in range(n)) / n.
+
+    Takes a rank-1 f32 tensor and produces a rank-0 f32 tensor.
+    Lowers to a sum reduction with a trailing divide by N.
+    """
+
+    name = "array.mean"
+
+    input = operand_def(TensorType)
+    result = result_def(TensorType)
+
+    assembly_format = "$input attr-dict `:` type($input) `->` type($result)"
+
+    traits = traits_def(Pure())
+
+    def __init__(self, input: SSAValue | Operation) -> None:
+        input_val = SSAValue.get(input)
+        result_type = TensorType(Float32Type(), [])
+        super().__init__(operands=[input], result_types=[result_type])
+
+    def verify_(self) -> None:
+        _verify_rank1_to_rank0_f32(self.name, self.input.type, self.result.type)
+
+
 ArrayDialect = Dialect(
     "array",
-    [AddOp, SubOp, ReluOp, ExpOp, MulScalarOp, DivScalarOp, SumOp, AmaxOp, DotOp],
+    [AddOp, SubOp, ReluOp, ExpOp, MulScalarOp, DivScalarOp, SumOp, AmaxOp, DotOp, MeanOp],
     [],
 )

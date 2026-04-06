@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from arrax.dsl.array import Array, amax, dot, sum
+from arrax.dsl.array import Array, amax, dot, mean, sum
 from arrax.dsl.tracer import trace
 
 
@@ -125,3 +125,12 @@ class TestTrace:
         assert result.shape == ()
         assert result.operands[0].op == "add"
         assert result.operands[1].op == "sub"
+
+    def test_trace_mean(self) -> None:
+        """mean(A) produces a rank-0 root node."""
+        result, params = trace(lambda A: mean(A), {"A": (128,)})
+        assert params == ["A"]
+        assert result.op == "mean"
+        assert result.shape == ()
+        assert len(result.operands) == 1
+        assert result.operands[0].is_leaf

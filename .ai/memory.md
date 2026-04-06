@@ -3,8 +3,8 @@
 ## Status
 - Milestone 1 + 1.1 complete: A + B end-to-end with strip-mine tiling
 - Milestone 2 complete: all 5 phases (sub, relu, exp, fusion, buffer opt, scalar mul/div)
-- Milestone 3 Phases 1-3 complete: sum, amax, dot end-to-end
-- 395 tests passing
+- Milestone 3 Phases 1-4 complete: sum, amax, dot, mean end-to-end
+- 427 tests passing
 - Dependencies: xdsl 0.59.0, numpy, riscv-npu (editable path dep at ../riscv-npu)
 - Python 3.14.2 via uv
 
@@ -28,12 +28,13 @@ trace -> dsl_to_array -> ArrayToLinalg -> Bufferize -> Tile -> Fuse -> BufferOpt
 - LinalgToNpu _match_reduction_body: dispatches on body shape via builder lambda
 - Terminal validator: reductions must be the func return in M3 (lifted in M4)
 - Bufferize promotes rank-0 tensor.empty reachable from return; non-terminal ones become memref.alloc
+- Mean: arrax.mean_divisor discardable attr on linalg.generic → FVReduceOp divisor property → fdiv.s
+- Bufferize & tile both copy discardable attrs when creating new GenericOp instances
+- _verify_rank1_to_rank0_f32 shared helper for SumOp/AmaxOp/MeanOp verify_
 
 ## Next
-- Milestone 3 Phase 4: mean (sum + post-loop divide by N)
 - Milestone 3 Phase 5: parallel→reduction fusion (lifting the safety guard in fusion.py)
 
-## Follow-ups (carry-forwards from Phase 2/3 reviews)
+## Follow-ups (carry-forwards from reviews)
 - I1: _emit_fv_reduce/_emit_fv_max/_emit_fv_mac share pool-binding boilerplate; extract _bind_reduction_acc helper
 - I2: _find_preceding_fill (linalg_to_npu) and _find_init_fill (tile) are near-duplicates; unify
-- N2: SumOp/AmaxOp verify_ duplicated; extract _verify_rank1_to_rank0_f32 when MeanOp adds 3rd copy

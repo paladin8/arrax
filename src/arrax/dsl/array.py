@@ -111,3 +111,16 @@ def amax(x: Array) -> Array:
     result.op = "amax"
     result.operands = [x]
     return result
+
+
+def mean(x: Array) -> Array:
+    """Mean-reduction across all elements. Returns a rank-0 Array.
+
+    Equivalent to ``sum(x) / len(x)`` but compiled as a single reduction with
+    a trailing divide. Reductions must be the compiled function's return value
+    (terminal); a non-terminal use raises at compile time.
+    """
+    result = Array(name="", shape=())
+    result.op = "mean"
+    result.operands = [x]
+    return result

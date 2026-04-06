@@ -15,6 +15,7 @@ from arrax.dialects.array_dialect import (
     DivScalarOp,
     DotOp,
     ExpOp,
+    MeanOp,
     MulScalarOp,
     ReluOp,
     SubOp,
@@ -463,3 +464,36 @@ builtin.module {
         ctx.load_dialect(Func)
         module = Parser(ctx, ir_text).parse_module()
         module.verify()
+
+
+class TestMeanOp:
+    def test_construction(self) -> None:
+        input_type = TensorType(Float32Type(), [128])
+        result_type = TensorType(Float32Type(), [])
+        input_val = create_ssa_value(input_type)
+        op = MeanOp(input_val)
+        assert op.input == input_val
+        assert op.result.type == result_type
+
+    def test_verify_rank1_f32_to_rank0(self) -> None:
+        input_type = TensorType(Float32Type(), [64])
+        input_val = create_ssa_value(input_type)
+        op = MeanOp(input_val)
+        op.verify()
+
+    def test_verify_rank2_input_fails(self) -> None:
+        input_type = TensorType(Float32Type(), [32, 64])
+        input_val = create_ssa_value(input_type)
+        op = MeanOp(input_val)
+        with pytest.raises(VerifyException, match="rank-1"):
+            op.verify()
+
+    def test_ir_prints_correctly(self) -> None:
+        input_type = TensorType(Float32Type(), [128])
+        input_val = create_ssa_value(input_type)
+        op = MeanOp(input_val)
+        module = ModuleOp([input_val.owner, op])
+        ir = str(module)
+        assert "array.mean" in ir
+        assert "tensor<128xf32>" in ir
+        assert "tensor<f32>" in ir

@@ -12,6 +12,7 @@ from arrax.dialects.array_dialect import (
     DivScalarOp,
     DotOp,
     ExpOp,
+    MeanOp,
     MulScalarOp,
     ReluOp,
     SubOp,
@@ -162,6 +163,11 @@ def dsl_to_array(
             dot_op = DotOp(lhs, rhs)
             entry_block.add_op(dot_op)
             val = dot_op.result
+        elif node.op == "mean":
+            operand = lower(node.operands[0])
+            mean_op = MeanOp(operand)
+            entry_block.add_op(mean_op)
+            val = mean_op.result
         else:
             raise ValueError(f"unsupported operation: {node.op}")
 

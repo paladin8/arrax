@@ -143,6 +143,10 @@ class BufferizePass(ModulePass):
                     iterator_types=op.iterator_types,
                     result_types=[],  # memref semantics: no results
                 )
+                # Preserve discardable attributes (e.g. arrax.mean_divisor).
+                for name, attr in op.attributes.items():
+                    if name not in new_generic.attributes:
+                        new_generic.attributes[name] = attr
                 new_block.add_op(new_generic)
 
                 # Map old tensor result → outs memref

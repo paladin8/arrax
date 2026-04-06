@@ -10,8 +10,10 @@ from xdsl.dialects.builtin import (
     AffineMapAttr,
     Float32Type,
     FloatAttr,
+    IntegerAttr,
     ModuleOp,
     TensorType,
+    i64,
 )
 from xdsl.dialects.linalg import IteratorTypeAttr
 from xdsl.ir import Block, Region
@@ -31,6 +33,7 @@ from arrax.dialects.array_dialect import (
     DivScalarOp,
     DotOp,
     ExpOp,
+    MeanOp,
     MulScalarOp,
     ReluOp,
     SubOp,
@@ -425,6 +428,64 @@ class DotToLinalgPattern(RewritePattern):
         )
 
 
+class MeanToLinalgPattern(RewritePattern):
+    """Rewrite array.mean to linalg.fill(0.0) + linalg.generic reduction.
+
+    The body is identical to sum (addf accumulator). The generic carries an
+    ``arrax.mean_divisor`` discardable attribute holding the input length as
+    ``IntegerAttr : i64``. Downstream passes (LinalgToNpu, asm emitter) read
+    this attribute to emit the trailing ``fdiv.s`` after the reduction loop.
+    """
+
+    @op_type_rewrite_pattern
+    def match_and_rewrite(self, op: MeanOp, rewriter: PatternRewriter) -> None:
+        input_type = op.input.type
+        assert isinstance(input_type, TensorType)
+        result_type = op.result.type
+        assert isinstance(result_type, TensorType)
+        f32 = Float32Type()
+        n = input_type.get_shape()[0]
+
+        # Rank-0 destination tensor, seeded with 0.0 via linalg.fill
+        empty = tensor.EmptyOp([], result_type)
+        zero = arith.ConstantOp(FloatAttr(0.0, f32))
+        fill = linalg.FillOp(
+            inputs=[zero.result],
+            outputs=[empty.tensor],
+            res=[result_type],
+        )
+
+        # Affine maps: input is (d0) -> (d0); output is (d0) -> () (scalar sink)
+        d0 = AffineMap.identity(1)
+        scalar_sink = AffineMap.from_callable(lambda d0: ())
+        maps = [AffineMapAttr(d0), AffineMapAttr(scalar_sink)]
+        iters = [IteratorTypeAttr.reduction()]
+
+        # Body: addf(acc, in), yield — same as sum.
+        scalar_types = [f32, f32]
+        block = Block(arg_types=scalar_types)
+        add = arith.AddfOp(block.args[1], block.args[0])
+        yield_op = linalg.YieldOp(add.result)
+        block.add_ops([add, yield_op])
+        body = Region([block])
+
+        generic = linalg.GenericOp(
+            inputs=[op.input],
+            outputs=[fill.res[0]],
+            body=body,
+            indexing_maps=maps,
+            iterator_types=iters,
+            result_types=[result_type],
+        )
+        # Attach the divisor as a discardable attribute; bufferize and tile
+        # clone attributes unchanged, so it will be visible to LinalgToNpu.
+        generic.attributes["arrax.mean_divisor"] = IntegerAttr(n, i64)
+
+        rewriter.replace_matched_op(
+            [empty, zero, fill, generic], [generic.res[0]]
+        )
+
+
 @dataclass(frozen=True)
 class ArrayToLinalgPass(ModulePass):
     """Lower array dialect ops to linalg.generic on tensors."""
@@ -443,5 +504,6 @@ class ArrayToLinalgPass(ModulePass):
                 SumToLinalgPattern(),
                 AmaxToLinalgPattern(),
                 DotToLinalgPattern(),
+                MeanToLinalgPattern(),
             ])
         ).rewrite_module(op)

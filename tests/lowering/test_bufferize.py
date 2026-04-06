@@ -15,7 +15,7 @@ from xdsl.dialects.linalg import IteratorTypeAttr
 from xdsl.ir import Block, Region
 from xdsl.ir.affine import AffineMap
 
-from arrax.dsl.array import Array, amax, dot, sum
+from arrax.dsl.array import Array, amax, dot, mean, sum
 from arrax.lowering.bufferize import BufferizePass
 from tests.helpers import bufferize, make_module
 
@@ -146,6 +146,17 @@ builtin.module {
         assert '"reduction"' in ir
         assert "arith.mulf" in ir
         assert "arith.addf" in ir
+
+    def test_mean_rank0_output_and_divisor_attr_preserved(self) -> None:
+        """mean(A): same as sum but arrax.mean_divisor attr survives bufferization."""
+        module = make_module(lambda A: mean(A), {"A": (64,)})
+        bufferize(module)
+        ir = str(module)
+        assert "tensor<" not in ir
+        assert "func.func @kernel(%0: memref<64xf32>, %1: memref<f32>)" in ir
+        assert "linalg.fill" in ir
+        assert '"reduction"' in ir
+        assert "arrax.mean_divisor = 64 : i64" in ir
 
     def test_sum_of_add_has_intermediate_alloc(self) -> None:
         """sum(A + B) needs a rank-1 alloc for the add and a rank-0 out arg."""

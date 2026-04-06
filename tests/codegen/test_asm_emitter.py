@@ -21,7 +21,7 @@ from arrax.codegen.asm_emitter import (
     emit_assembly,
 )
 from arrax.dialects.npu_dialect import FVAddOp, FVSubOp
-from arrax.dsl.array import Array, amax, dot, exp, relu, sum
+from arrax.dsl.array import Array, amax, dot, exp, mean, relu, sum
 from arrax.lowering.array_to_linalg import ArrayToLinalgPass
 from arrax.lowering.bufferize import BufferizePass
 from arrax.lowering.linalg_to_npu import LinalgToNpuPass
@@ -609,6 +609,58 @@ kernel:
         asm = _to_asm_tiled(module)
         assert ".Lfor_" in asm
         assert ".insn r 0x2B, 0x0, 0x01" in asm
+
+    # --- mean reduction ---
+
+    def test_mean_untiled(self) -> None:
+        """mean(A), N=64: FVREDUCE + fadd.s + trailing fdiv.s + fsw."""
+        module = make_module(lambda A: mean(A), {"A": (64,)})
+        asm = _to_asm_tiled(module)
+        assert ".insn r 0x2B, 0x0, 0x05" in asm  # FVREDUCE
+        assert "fadd.s fs0, fs0" in asm
+        assert "fdiv.s fs0, fs0, ft1" in asm
+        assert "fsw fs0, 0(a1)" in asm
+
+    def test_mean_tiled(self) -> None:
+        """mean(A), N=128: FVREDUCE in loop, fdiv.s after loop, fsw at end."""
+        module = make_module(lambda A: mean(A), {"A": (128,)})
+        asm = _to_asm_tiled(module)
+        assert ".Lfor_" in asm
+        assert ".insn r 0x2B, 0x0, 0x05" in asm  # FVREDUCE
+        assert "fdiv.s fs0, fs0, ft1" in asm
+        assert "fsw fs0, 0(a1)" in asm
+        # fdiv.s must come AFTER the loop, not inside it
+        post_loop = asm.split(".Lfor_end")[-1]
+        assert "fdiv.s" in post_loop
+
+    def test_mean_tiled_fdiv_before_store(self) -> None:
+        """The fdiv.s must appear between the loop end and the terminal fsw."""
+        module = make_module(lambda A: mean(A), {"A": (128,)})
+        asm = _to_asm_tiled(module)
+        fdiv_idx = asm.index("fdiv.s")
+        fsw_idx = asm.index("fsw fs0")
+        assert fdiv_idx < fsw_idx
+
+    def test_mean_non_multiple(self) -> None:
+        """mean(A), N=100: remainder handled, fdiv.s still present."""
+        module = make_module(lambda A: mean(A), {"A": (100,)})
+        asm = _to_asm_tiled(module)
+        assert ".Lfor_" in asm
+        assert ".insn r 0x2B, 0x0, 0x05" in asm
+        assert "fdiv.s fs0, fs0, ft1" in asm
+
+    def test_mean_large(self) -> None:
+        """mean(A), N=1024."""
+        module = make_module(lambda A: mean(A), {"A": (1024,)})
+        asm = _to_asm_tiled(module)
+        assert ".Lfor_" in asm
+        assert "fdiv.s" in asm
+
+    def test_sum_no_fdiv(self) -> None:
+        """sum(A) must NOT have fdiv.s (no divisor)."""
+        module = make_module(lambda A: sum(A), {"A": (128,)})
+        asm = _to_asm_tiled(module)
+        assert "fdiv.s" not in asm
 
 
 class TestScalarFPRegisterPool:

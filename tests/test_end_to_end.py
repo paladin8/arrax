@@ -8,7 +8,7 @@ import numpy as np
 from riscv_npu import Emulator
 
 from arrax.codegen.build import build_elf
-from arrax.dsl.array import Array, amax, dot, exp, relu
+from arrax.dsl.array import Array, amax, dot, exp, mean, relu
 from arrax.dsl.array import sum as arr_sum
 from arrax.pipeline import compile_to_asm
 
@@ -740,6 +740,62 @@ class TestEndToEnd:
             tmp_path,
         )
         np.testing.assert_allclose(actual, expected, atol=1e-7)
+
+    def test_mean_small(self, tmp_path: Path) -> None:
+        """mean(A) with N=16: untiled mean reduction."""
+        N = 16
+        A = np.arange(N, dtype=np.float32)
+        expected = float(A.mean())
+
+        actual, _ = _compile_and_run_scalar(
+            lambda A: mean(A),
+            {"A": (N,)},
+            {"A": A},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-5)
+
+    def test_mean_exact_tile(self, tmp_path: Path) -> None:
+        """mean(A) with N=64: exact one-tile untiled mean."""
+        N = 64
+        A = np.linspace(-1.0, 1.0, N, dtype=np.float32)
+        expected = float(A.mean())
+
+        actual, _ = _compile_and_run_scalar(
+            lambda A: mean(A),
+            {"A": (N,)},
+            {"A": A},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-5)
+
+    def test_mean_non_multiple(self, tmp_path: Path) -> None:
+        """mean(A) with N=100: tiled mean with remainder chunk."""
+        N = 100
+        A = np.arange(N, dtype=np.float32) * 0.1
+        expected = float(A.mean())
+
+        actual, _ = _compile_and_run_scalar(
+            lambda A: mean(A),
+            {"A": (N,)},
+            {"A": A},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-4)
+
+    def test_mean_large(self, tmp_path: Path) -> None:
+        """mean(A) with N=1024: many tiled iterations."""
+        N = 1024
+        A = np.ones(N, dtype=np.float32) * 3.0
+        expected = float(A.mean())  # 3.0
+
+        actual, _ = _compile_and_run_scalar(
+            lambda A: mean(A),
+            {"A": (N,)},
+            {"A": A},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-4)
 
     def test_reports_cycles(self, tmp_path: Path) -> None:
         """Emulator reports nonzero cycle count."""

@@ -304,6 +304,12 @@ class LinalgReductionToNpuPattern(RewritePattern):
         # Build the npu reduction op.
         reduction_op = npu_op_builder(n_ssa, acc_in)
 
+        # Propagate mean divisor attribute to FVReduceOp property.
+        if isinstance(reduction_op, FVReduceOp):
+            divisor_attr = op.attributes.get("arrax.mean_divisor")
+            if divisor_attr is not None:
+                reduction_op.properties["divisor"] = divisor_attr
+
         load = _find_following_load(op, out_val)
         if load is not None:
             # Tiled case: reduction_op.result takes the load's place.

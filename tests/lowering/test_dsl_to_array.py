@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from arrax.dsl.array import Array, amax, dot, sum
+from arrax.dsl.array import Array, amax, dot, mean, sum
 from arrax.dsl.tracer import trace
 from arrax.lowering.dsl_to_array import dsl_to_array
 from tests.helpers import make_module
@@ -136,3 +136,12 @@ builtin.module {
         ir = str(module)
         assert "array.add" in ir
         assert "array.dot" in ir
+
+    def test_mean_produces_array_mean(self) -> None:
+        """mean(A) produces array.mean IR."""
+        module = make_module(lambda A: mean(A), {"A": (128,)})
+        module.verify()
+        ir = str(module)
+        assert "array.mean" in ir
+        assert "tensor<f32>" in ir
+        assert "func.func @kernel(%0: tensor<128xf32>) -> tensor<f32>" in ir

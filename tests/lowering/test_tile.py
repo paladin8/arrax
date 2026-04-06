@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from arrax.dsl.array import Array, amax, dot, sum
+from arrax.dsl.array import Array, amax, dot, mean, sum
 from tests.helpers import bufferize, make_module, tile
 
 
@@ -240,6 +240,29 @@ class TestTile:
     def test_dot_verifies(self) -> None:
         """Tiled dot reduction IR passes xDSL verification."""
         module = make_module(lambda A, B: dot(A, B), {"A": (100,), "B": (100,)})
+        tile(module)
+        module.verify()
+
+    # --- mean reduction tiling ---
+
+    def test_mean_tiled_preserves_divisor_attr(self) -> None:
+        """mean(A), n=128: tiling preserves arrax.mean_divisor on the inner generic."""
+        module = make_module(lambda A: mean(A), {"A": (128,)})
+        tile(module)
+        ir = str(module)
+        assert "scf.for" in ir
+        assert "arrax.mean_divisor = 128 : i64" in ir
+
+    def test_mean_untiled_preserves_divisor_attr(self) -> None:
+        """mean(A), n=32: no tiling, divisor attr still present."""
+        module = make_module(lambda A: mean(A), {"A": (32,)})
+        tile(module)
+        ir = str(module)
+        assert "arrax.mean_divisor = 32 : i64" in ir
+
+    def test_mean_tiled_verifies(self) -> None:
+        """Tiled mean reduction IR passes xDSL verification."""
+        module = make_module(lambda A: mean(A), {"A": (100,)})
         tile(module)
         module.verify()
 

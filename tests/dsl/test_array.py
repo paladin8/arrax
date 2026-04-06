@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from arrax.dsl.array import Array, amax, dot, exp, relu, sum
+from arrax.dsl.array import Array, amax, dot, exp, mean, relu, sum
 
 
 class TestArray:
@@ -220,3 +220,17 @@ class TestArray:
         b = Array("B", (4, 8))
         with pytest.raises(ValueError, match="1D"):
             dot(a, b)
+
+    def test_mean_creates_dag_node(self) -> None:
+        a = Array("A", (64,))
+        result = mean(a)
+        assert result.shape == ()
+        assert result.op == "mean"
+        assert result.operands == [a]
+
+    def test_mean_of_add(self) -> None:
+        a = Array("A", (64,))
+        b = Array("B", (64,))
+        result = mean(a + b)
+        assert result.op == "mean"
+        assert result.operands[0].op == "add"

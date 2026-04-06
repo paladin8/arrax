@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from arrax.dsl.array import Array, amax, dot, sum
+from arrax.dsl.array import Array, amax, dot, mean, sum
 from arrax.dsl.tracer import trace
 from arrax.lowering.dsl_to_array import dsl_to_array
 
@@ -47,6 +47,12 @@ class TestAcceptedReductions:
         _compile_to_array(
             lambda A, B, C: dot(A + B, C), {"A": (64,), "B": (64,), "C": (64,)}
         )
+
+    def test_bare_mean(self) -> None:
+        _compile_to_array(lambda A: mean(A), {"A": (64,)})
+
+    def test_mean_of_add(self) -> None:
+        _compile_to_array(lambda A, B: mean(A + B), {"A": (64,), "B": (64,)})
 
 
 class TestRejectedReductions:
@@ -91,3 +97,13 @@ class TestRejectedReductions:
         root.operands = [a, d]
         with pytest.raises(ValueError, match="dot"):
             dsl_to_array(root, ["A", "B"], {"A": (64,), "B": (64,)})
+
+    def test_mean_fed_into_add_raises(self) -> None:
+        """A + mean(A) — mean has a non-root user."""
+        a = Array("A", (64,))
+        m = mean(a)
+        root = Array(name="", shape=(64,))
+        root.op = "add"
+        root.operands = [a, m]
+        with pytest.raises(ValueError, match="mean"):
+            dsl_to_array(root, ["A"], {"A": (64,)})
