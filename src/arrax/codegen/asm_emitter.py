@@ -38,6 +38,7 @@ from arrax.dialects.npu_dialect import (
     FVAddOp,
     FVDivOp,
     FVExpOp,
+    FVMacOp,
     FVMaxOp,
     FVMulOp,
     FVReduceOp,
@@ -311,6 +312,8 @@ class _AsmEmitter:
             self._emit_fv_reduce(op)
         elif isinstance(op, FVMaxOp):
             self._emit_fv_max(op)
+        elif isinstance(op, FVMacOp):
+            self._emit_fv_mac(op)
         elif isinstance(op, scf.ForOp):
             self._emit_for(op)
         elif isinstance(op, memref.SubviewOp):
@@ -413,12 +416,22 @@ class _AsmEmitter:
             # Materialize init value into the register before the loop.
             self._materialize_f32_into(init_val, fp_reg)
 
+        # Detect FVMacOp in the body — dot uses hardware facc, which
+        # accumulates across iterations.  Bracket the loop with FRSTACC.
+        has_fvmac = any(isinstance(bop, FVMacOp) for bop in body.ops)
+
         # Initialize IV from lower bound
         if id(op.lb) in self._const_map and self._const_map[id(op.lb)] == 0:
             self._lines.append(f"    li {iv_reg}, 0")
         else:
             lb_reg = self._load_operand(op.lb, "t0")
             self._lines.append(f"    mv {iv_reg}, {lb_reg}")
+
+        if has_fvmac:
+            self._lines.append(f"    # FRSTACC: zero facc before dot loop")
+            self._lines.append(
+                f"    .insn r 0x2B, 0x5, 0x00, f0, f0, f0"
+            )
 
         loop_label = f".Lfor_{self._label_count}"
         end_label = f".Lfor_end_{self._label_count}"
@@ -453,6 +466,15 @@ class _AsmEmitter:
 
         self._lines.append(f"    j {loop_label}")
         self._lines.append(f"{end_label}:")
+
+        if has_fvmac:
+            # Read facc into the iter_arg's pool register. This overwrites
+            # the cosmetic 0.0 that _materialize_f32_into loaded earlier.
+            acc_reg = self._fp_pool.get(op.results[0])
+            self._lines.append(f"    # FRSTACC: read facc into {acc_reg}")
+            self._lines.append(
+                f"    .insn r 0x2B, 0x5, 0x00, {acc_reg}, f0, f0"
+            )
 
         # Restore s-reg counter for sequential loop reuse
         self._s_reg_count = loop_s_reg_start
@@ -589,6 +611,62 @@ class _AsmEmitter:
         self._lines.append(f"    bnez t0, {nan_skip_label}")
         self._lines.append(f"    fmv.s {acc_reg}, ft0")
         self._lines.append(f"{nan_skip_label}:")
+
+    def _emit_fv_mac(self, op: FVMacOp) -> None:
+        """Emit NPU.FVMAC with FRSTACC bracketing.
+
+        Unlike sum/amax which combine per-chunk results via scalar ``fadd.s``
+        / ``fmax.s``, dot accumulates directly in the hardware ``facc``
+        register across iterations. The ``acc_in`` / ``result`` SSA thread
+        is cosmetic — the real state lives in ``facc``.
+
+        Untiled (straight-line): FRSTACC zero, FVMAC .insn, FRSTACC read.
+        Tiled (inside scf.for): only FVMAC .insn; the FRSTACC bracket is
+        emitted by ``_emit_for`` around the loop.
+        """
+        lhs = self._reg(op.lhs)
+        rhs = self._reg(op.rhs)
+
+        # Pool register handling: bind result to the same register as acc_in.
+        if self._fp_pool.contains(op.acc_in):
+            acc_reg = self._fp_pool.get(op.acc_in)
+        else:
+            acc_reg = self._fp_pool.allocate(op.acc_in)
+        self._fp_pool.bind(op.result, acc_reg)
+
+        # Check if inside a tiled loop (facc persists across iterations).
+        in_loop = isinstance(op.parent_op(), scf.ForOp)
+
+        # Resolve n: constant → "t0" (loaded inline), register → its name.
+        n_is_const = id(op.n) in self._const_map
+
+        if not in_loop:
+            # Untiled: full FRSTACC bracket inline.
+            self._lines.append(f"    # FRSTACC: zero facc")
+            self._lines.append(
+                f"    .insn r 0x2B, 0x5, 0x00, f0, f0, f0"
+            )
+
+        self._lines.append(
+            f"    # NPU.FVMAC facc += dot({lhs}, {rhs})"
+        )
+        if n_is_const:
+            self._lines.append(f"    li t0, {self._const(op.n)}")
+            self._lines.append(
+                f"    .insn r 0x2B, 0x0, 0x01, t0, {lhs}, {rhs}"
+            )
+        else:
+            n_reg = self._reg(op.n)
+            self._lines.append(
+                f"    .insn r 0x2B, 0x0, 0x01, {n_reg}, {lhs}, {rhs}"
+            )
+
+        if not in_loop:
+            # Untiled: read facc into the pool register.
+            self._lines.append(f"    # FRSTACC: read facc into {acc_reg}")
+            self._lines.append(
+                f"    .insn r 0x2B, 0x5, 0x00, {acc_reg}, f0, f0"
+            )
 
     def _emit_store(self, op: memref.StoreOp) -> None:
         """Emit a rank-0 f32 store: ``fsw <val>, 0(<base>)``.

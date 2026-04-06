@@ -15,7 +15,7 @@ from xdsl.dialects.linalg import IteratorTypeAttr
 from xdsl.ir import Block, Region
 from xdsl.ir.affine import AffineMap
 
-from arrax.dsl.array import Array, amax, sum
+from arrax.dsl.array import Array, amax, dot, sum
 from arrax.lowering.bufferize import BufferizePass
 from tests.helpers import bufferize, make_module
 
@@ -133,6 +133,19 @@ builtin.module {
         # -inf identity seed survives bufferization unchanged.
         assert "0xff800000" in ir.lower()
         assert "arith.maximumf" in ir
+
+    def test_dot_rank0_output_is_function_arg(self) -> None:
+        """dot(A, B): rank-0 output promoted to function arg with three memref args."""
+        module = make_module(lambda A, B: dot(A, B), {"A": (64,), "B": (64,)})
+        bufferize(module)
+        ir = str(module)
+        assert "tensor<" not in ir
+        assert "func.func @kernel(%0: memref<64xf32>, %1: memref<64xf32>, %2: memref<f32>)" in ir
+        assert "linalg.fill" in ir
+        assert "memref<f32>" in ir
+        assert '"reduction"' in ir
+        assert "arith.mulf" in ir
+        assert "arith.addf" in ir
 
     def test_sum_of_add_has_intermediate_alloc(self) -> None:
         """sum(A + B) needs a rank-1 alloc for the add and a rank-0 out arg."""

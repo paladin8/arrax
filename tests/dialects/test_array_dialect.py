@@ -13,6 +13,7 @@ from arrax.dialects.array_dialect import (
     AmaxOp,
     ArrayDialect,
     DivScalarOp,
+    DotOp,
     ExpOp,
     MulScalarOp,
     ReluOp,
@@ -379,6 +380,80 @@ class TestAmaxOp:
 builtin.module {
   func.func @test(%a: tensor<128xf32>) -> tensor<f32> {
     %0 = array.amax %a : tensor<128xf32> -> tensor<f32>
+    func.return %0 : tensor<f32>
+  }
+}"""
+        ctx = Context()
+        ctx.load_dialect(Builtin)
+        ctx.load_dialect(ArrayDialect)
+        ctx.load_dialect(Func)
+        module = Parser(ctx, ir_text).parse_module()
+        module.verify()
+
+
+class TestDotOp:
+    def test_construction(self) -> None:
+        f32 = Float32Type()
+        result_type = TensorType(f32, [])
+        lhs = create_ssa_value(TensorType(f32, [128]))
+        rhs = create_ssa_value(TensorType(f32, [128]))
+        op = DotOp(lhs, rhs)
+        assert op.lhs == lhs
+        assert op.rhs == rhs
+        assert op.result.type == result_type
+
+    def test_verify_rank1_f32_to_rank0(self) -> None:
+        f32 = Float32Type()
+        lhs = create_ssa_value(TensorType(f32, [64]))
+        rhs = create_ssa_value(TensorType(f32, [64]))
+        op = DotOp(lhs, rhs)
+        op.verify()
+
+    def test_verify_rank2_input_fails(self) -> None:
+        f32 = Float32Type()
+        lhs = create_ssa_value(TensorType(f32, [32, 64]))
+        rhs = create_ssa_value(TensorType(f32, [32, 64]))
+        op = DotOp(lhs, rhs)
+        with pytest.raises(VerifyException, match="rank-1"):
+            op.verify()
+
+    def test_verify_shape_mismatch_fails(self) -> None:
+        f32 = Float32Type()
+        lhs = create_ssa_value(TensorType(f32, [32]))
+        rhs = create_ssa_value(TensorType(f32, [64]))
+        op = DotOp(lhs, rhs)
+        with pytest.raises(VerifyException, match="matching"):
+            op.verify()
+
+    def test_verify_rank0_input_fails(self) -> None:
+        f32 = Float32Type()
+        lhs = create_ssa_value(TensorType(f32, []))
+        rhs = create_ssa_value(TensorType(f32, []))
+        op = DotOp(lhs, rhs)
+        with pytest.raises(VerifyException, match="rank-1"):
+            op.verify()
+
+    def test_ir_prints_correctly(self) -> None:
+        f32 = Float32Type()
+        lhs = create_ssa_value(TensorType(f32, [128]))
+        rhs = create_ssa_value(TensorType(f32, [128]))
+        op = DotOp(lhs, rhs)
+        module = ModuleOp([lhs.owner, rhs.owner, op])
+        ir = str(module)
+        assert "array.dot" in ir
+        assert "tensor<128xf32>" in ir
+        assert "tensor<f32>" in ir
+
+    def test_ir_round_trips(self) -> None:
+        from xdsl.context import Context
+        from xdsl.parser import Parser
+        from xdsl.dialects.builtin import Builtin
+        from xdsl.dialects.func import Func
+
+        ir_text = """\
+builtin.module {
+  func.func @test(%a: tensor<128xf32>, %b: tensor<128xf32>) -> tensor<f32> {
+    %0 = array.dot %a, %b : tensor<128xf32>, tensor<128xf32> -> tensor<f32>
     func.return %0 : tensor<f32>
   }
 }"""

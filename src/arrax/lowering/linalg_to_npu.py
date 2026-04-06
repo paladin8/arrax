@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from xdsl.context import Context
@@ -16,7 +17,7 @@ from xdsl.dialects.builtin import (
     ModuleOp,
 )
 from xdsl.dialects.linalg import IteratorType
-from xdsl.ir import SSAValue
+from xdsl.ir import Block, Operation, SSAValue
 from xdsl.ir.affine import AffineMap
 from xdsl.passes import ModulePass
 from xdsl.pattern_rewriter import (
@@ -31,6 +32,7 @@ from arrax.dialects.npu_dialect import (
     FVAddOp,
     FVDivOp,
     FVExpOp,
+    FVMacOp,
     FVMaxOp,
     FVMulOp,
     FVReduceOp,
@@ -230,9 +232,12 @@ class LinalgReductionToNpuPattern(RewritePattern):
     Body-shape dispatch:
       - ``arith.addf(a, b), linalg.yield`` -> ``npu.fvreduce``  (sum/mean)
       - ``arith.maximumf(a, b), linalg.yield`` -> ``npu.fvmax``  (amax)
+      - ``arith.mulf(a, b), arith.addf(acc, prod), linalg.yield`` -> ``npu.fvmac``  (dot)
 
-    Operand order inside the combiner is irrelevant: ``{a, b}`` must be the
-    pair of block arguments.
+    For single-input reductions, operand order inside the combiner is
+    irrelevant: ``{a, b}`` must be the pair of block arguments.
+    For dot, the two data block args feed mulf and the accumulator block arg
+    feeds addf.
     """
 
     @op_type_rewrite_pattern
@@ -258,41 +263,29 @@ class LinalgReductionToNpuPattern(RewritePattern):
         if not isinstance(out_type.element_type, Float32Type):
             return
 
-        # Single rank-1 f32 memref input (sum/amax/mean form)
+        # Rank-1 f32 memref inputs (1 for sum/amax, 2 for dot)
         inputs = list(op.inputs)
-        if len(inputs) != 1:
+        if len(inputs) not in (1, 2):
             return
-        src = inputs[0]
-        src_type = src.type
-        if not isinstance(src_type, MemRefType):
-            return
-        if len(src_type.get_shape()) != 1:
-            return
-        if not isinstance(src_type.element_type, Float32Type):
-            return
+        for inp in inputs:
+            inp_type = inp.type
+            if not isinstance(inp_type, MemRefType):
+                return
+            if len(inp_type.get_shape()) != 1:
+                return
+            if not isinstance(inp_type.element_type, Float32Type):
+                return
 
-        # Body must be: <combiner>(bb0, bb1), yield, where combiner is
-        # one of the recognized single-input reduction shapes.
+        # Dispatch on body shape to select the NPU op.
         body_block = op.body.blocks.first
         if body_block is None:
             return
         body_ops = list(body_block.ops)
-        if len(body_ops) != 2:
-            return
-        combiner = body_ops[0]
-        if isinstance(combiner, arith.AddfOp):
-            npu_op_cls: type = FVReduceOp
-        elif isinstance(combiner, arith.MaximumfOp):
-            npu_op_cls = FVMaxOp
-        else:
-            return
-        if not isinstance(body_ops[1], linalg.YieldOp):
-            return
-        bargs = set(body_block.args)
-        if {combiner.lhs, combiner.rhs} != bargs:
-            return
-        yield_op = body_ops[1]
-        if list(yield_op.operands) != [combiner.result]:
+
+        npu_op_builder = self._match_reduction_body(
+            inputs, body_block, body_ops,
+        )
+        if npu_op_builder is None:
             return
 
         # Find the fill that seeds our outs (must be in the same block,
@@ -302,14 +295,14 @@ class LinalgReductionToNpuPattern(RewritePattern):
             return
         acc_in = list(fill.inputs)[0]
 
-        # Extract the element count
-        extracted = _extract_n(src, rewriter)
+        # Extract the element count from the first input
+        extracted = _extract_n(inputs[0], rewriter)
         if extracted is None:
             return
         extra_ops, n_ssa = extracted
 
-        # Build the npu reduction op (fvreduce for sum, fvmax for amax).
-        reduction_op = npu_op_cls(src, n_ssa, acc_in)
+        # Build the npu reduction op.
+        reduction_op = npu_op_builder(n_ssa, acc_in)
 
         load = _find_following_load(op, out_val)
         if load is not None:
@@ -332,6 +325,61 @@ class LinalgReductionToNpuPattern(RewritePattern):
             store = memref.StoreOp.get(reduction_op.result, out_val, [])
             rewriter.replace_matched_op([*extra_ops, reduction_op, store], [])
             rewriter.erase_op(fill)
+
+
+    @staticmethod
+    def _match_reduction_body(
+        inputs: list[SSAValue],
+        body_block: Block,
+        body_ops: list,
+    ) -> Callable[[SSAValue, SSAValue], Operation] | None:
+        """Match the body ops and return a builder ``(n, acc_in) -> npu_op``.
+
+        Single-input (sum/amax): 2 ops — combiner(bb0, bb1), yield
+        Two-input (dot):         3 ops — mulf(bb0, bb1), addf(bb2, prod), yield
+        """
+        bargs = list(body_block.args)
+
+        if len(inputs) == 1 and len(body_ops) == 2:
+            combiner = body_ops[0]
+            if isinstance(combiner, arith.AddfOp):
+                npu_op_cls: type = FVReduceOp
+            elif isinstance(combiner, arith.MaximumfOp):
+                npu_op_cls = FVMaxOp
+            else:
+                return None
+            if not isinstance(body_ops[1], linalg.YieldOp):
+                return None
+            if {combiner.lhs, combiner.rhs} != set(bargs):
+                return None
+            if list(body_ops[1].operands) != [combiner.result]:
+                return None
+            src = inputs[0]
+            return lambda n, acc: npu_op_cls(src, n, acc)
+
+        if len(inputs) == 2 and len(body_ops) == 3:
+            # dot: mulf(data_a, data_b), addf(acc, prod), yield
+            mulf_op = body_ops[0]
+            addf_op = body_ops[1]
+            yield_op = body_ops[2]
+            if not isinstance(mulf_op, arith.MulfOp):
+                return None
+            if not isinstance(addf_op, arith.AddfOp):
+                return None
+            if not isinstance(yield_op, linalg.YieldOp):
+                return None
+            # mulf operands must be the two data block args (bb0, bb1)
+            if {mulf_op.lhs, mulf_op.rhs} != {bargs[0], bargs[1]}:
+                return None
+            # addf operands must be the acc block arg (bb2) and mulf result
+            if {addf_op.lhs, addf_op.rhs} != {bargs[2], mulf_op.result}:
+                return None
+            if list(yield_op.operands) != [addf_op.result]:
+                return None
+            lhs, rhs = inputs[0], inputs[1]
+            return lambda n, acc: FVMacOp(lhs, rhs, n, acc)
+
+        return None
 
 
 def _find_preceding_fill(

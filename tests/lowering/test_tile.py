@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from arrax.dsl.array import Array, amax, sum
+from arrax.dsl.array import Array, amax, dot, sum
 from tests.helpers import bufferize, make_module, tile
 
 
@@ -197,6 +197,49 @@ class TestTile:
     def test_amax_reduction_verifies(self) -> None:
         """Tiled amax reduction IR passes xDSL verification."""
         module = make_module(lambda A: amax(A), {"A": (100,)})
+        tile(module)
+        module.verify()
+
+    # --- dot reduction tiling ---
+
+    def test_dot_below_limit_unchanged(self) -> None:
+        """dot(A, B), n=32: untiled reduction passes through."""
+        expected = str(bufferize(make_module(lambda A, B: dot(A, B), {"A": (32,), "B": (32,)})))
+
+        module = make_module(lambda A, B: dot(A, B), {"A": (32,), "B": (32,)})
+        tile(module)
+        assert str(module) == expected
+
+    def test_dot_exact_multiple(self) -> None:
+        """dot(A, B), n=128: scf.for with f32 iter_args, two input subviews."""
+        module = make_module(lambda A, B: dot(A, B), {"A": (128,), "B": (128,)})
+        tile(module)
+        ir = str(module)
+        assert "scf.for" in ir
+        assert "iter_args" in ir
+        assert "-> (f32)" in ir
+        # Two memref.subviews (one for each input)
+        assert ir.count("memref.subview") >= 2
+        assert "memref.alloca" in ir
+        assert "linalg.fill" in ir
+        assert '"reduction"' in ir
+        assert "arith.mulf" in ir
+        assert "arith.addf" in ir
+        assert "memref.load" in ir
+        assert "scf.yield" in ir
+        assert "memref.store" in ir
+
+    def test_dot_non_multiple(self) -> None:
+        """dot(A, B), n=100: remainder handled."""
+        module = make_module(lambda A, B: dot(A, B), {"A": (100,), "B": (100,)})
+        tile(module)
+        ir = str(module)
+        assert "scf.for" in ir
+        assert "arith.minsi" in ir
+
+    def test_dot_verifies(self) -> None:
+        """Tiled dot reduction IR passes xDSL verification."""
+        module = make_module(lambda A, B: dot(A, B), {"A": (100,), "B": (100,)})
         tile(module)
         module.verify()
 

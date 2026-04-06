@@ -29,6 +29,7 @@ from arrax.dialects.array_dialect import (
     AddOp,
     AmaxOp,
     DivScalarOp,
+    DotOp,
     ExpOp,
     MulScalarOp,
     ReluOp,
@@ -365,6 +366,65 @@ class AmaxToLinalgPattern(RewritePattern):
         )
 
 
+class DotToLinalgPattern(RewritePattern):
+    """Rewrite array.dot to linalg.fill(0.0) + linalg.generic reduction.
+
+    The reduction generic takes two rank-1 inputs and a rank-0 output
+    initialized to 0.0 via linalg.fill. Its body multiplies corresponding
+    elements and accumulates the product into the output:
+
+        outs initialized via linalg.fill(0.0)
+        body: ^bb0(%in_a, %in_b, %acc): %p = mulf %in_a, %in_b
+                                         %s = addf %acc, %p
+                                         yield %s
+
+    xDSL 0.59 has no ``linalg.DotOp``; the named-op path is preferred
+    when available in a later xDSL version.
+    """
+
+    @op_type_rewrite_pattern
+    def match_and_rewrite(self, op: DotOp, rewriter: PatternRewriter) -> None:
+        result_type = op.result.type
+        assert isinstance(result_type, TensorType)
+        f32 = Float32Type()
+
+        # Rank-0 destination tensor, seeded with 0.0 via linalg.fill
+        empty = tensor.EmptyOp([], result_type)
+        zero = arith.ConstantOp(FloatAttr(0.0, f32))
+        fill = linalg.FillOp(
+            inputs=[zero.result],
+            outputs=[empty.tensor],
+            res=[result_type],
+        )
+
+        # Affine maps: two inputs are (d0) -> (d0); output is (d0) -> ()
+        d0 = AffineMap.identity(1)
+        scalar_sink = AffineMap.from_callable(lambda d0: ())
+        maps = [AffineMapAttr(d0), AffineMapAttr(d0), AffineMapAttr(scalar_sink)]
+        iters = [IteratorTypeAttr.reduction()]
+
+        # Body: mulf(in_a, in_b), addf(acc, prod), yield.
+        # Block args are (in_a, in_b, acc).
+        block = Block(arg_types=[f32, f32, f32])
+        mul = arith.MulfOp(block.args[0], block.args[1])
+        add = arith.AddfOp(block.args[2], mul.result)
+        yield_op = linalg.YieldOp(add.result)
+        block.add_ops([mul, add, yield_op])
+        body = Region([block])
+
+        generic = linalg.GenericOp(
+            inputs=[op.lhs, op.rhs],
+            outputs=[fill.res[0]],
+            body=body,
+            indexing_maps=maps,
+            iterator_types=iters,
+            result_types=[result_type],
+        )
+        rewriter.replace_matched_op(
+            [empty, zero, fill, generic], [generic.res[0]]
+        )
+
+
 @dataclass(frozen=True)
 class ArrayToLinalgPass(ModulePass):
     """Lower array dialect ops to linalg.generic on tensors."""
@@ -382,5 +442,6 @@ class ArrayToLinalgPass(ModulePass):
                 DivScalarToLinalgPattern(),
                 SumToLinalgPattern(),
                 AmaxToLinalgPattern(),
+                DotToLinalgPattern(),
             ])
         ).rewrite_module(op)

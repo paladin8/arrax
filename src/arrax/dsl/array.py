@@ -79,6 +79,27 @@ def sum(x: Array) -> Array:
     return result
 
 
+def dot(a: Array, b: Array) -> Array:
+    """Dot product of two 1D arrays. Returns a rank-0 Array.
+
+    Requires both inputs to be 1D with matching shapes.
+    Reductions must be the compiled function's return value (terminal); a
+    non-terminal use raises at compile time.
+    """
+    if len(a.shape) != 1 or len(b.shape) != 1:
+        raise ValueError(
+            f"dot requires 1D inputs, got shapes {a.shape} and {b.shape}"
+        )
+    if a.shape != b.shape:
+        raise ValueError(
+            f"dot requires matching shapes, got {a.shape} and {b.shape}"
+        )
+    result = Array(name="", shape=())
+    result.op = "dot"
+    result.operands = [a, b]
+    return result
+
+
 def amax(x: Array) -> Array:
     """Max-reduction across all elements. Returns a rank-0 Array.
 

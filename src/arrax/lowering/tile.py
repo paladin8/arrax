@@ -167,16 +167,22 @@ class TileLinalgPattern(RewritePattern):
             return
 
         inputs = list(op.inputs)
-        if len(inputs) != 1:
-            return  # sum/amax/mean shape; dot is two inputs, handled later
-        src = inputs[0]
-        src_type = src.type
+        if not inputs:
+            return
+        # All inputs must be rank-1 memrefs of the same length.
+        src_type = inputs[0].type
         if not isinstance(src_type, MemRefType):
             return
         src_shape = src_type.get_shape()
         if len(src_shape) != 1:
             return
         n = src_shape[0]
+        for inp in inputs[1:]:
+            inp_type = inp.type
+            if not isinstance(inp_type, MemRefType):
+                return
+            if inp_type.get_shape() != src_shape:
+                return
         if n <= NPU_MAX_VEC_LEN:
             return  # fast path: untiled reduction handled by LinalgToNpu
 
@@ -205,14 +211,17 @@ class TileLinalgPattern(RewritePattern):
         remaining = arith.SubiOp(cn.result, iv)
         chunk = arith.MinSIOp(cstep.result, remaining)
 
-        # Subview the 1D input for this tile
-        sub_in = memref.SubviewOp.get(
-            source=src,
-            offsets=[iv],
-            sizes=[chunk.result],
-            strides=[1],
-            result_type=_dynamic_subview_type(src_type),
-        )
+        # Subview each rank-1 input for this tile
+        sub_inputs = []
+        for inp in inputs:
+            sv = memref.SubviewOp.get(
+                source=inp,
+                offsets=[iv],
+                sizes=[chunk.result],
+                strides=[1],
+                result_type=_dynamic_subview_type(inp.type),
+            )
+            sub_inputs.append(sv)
 
         # Rank-0 scratch on the stack, seeded with the current accumulator
         scratch = memref.AllocaOp.get(f32, shape=[])
@@ -225,7 +234,7 @@ class TileLinalgPattern(RewritePattern):
         # Inner reduction generic on the tile, writing into scratch
         new_body = op.body.clone()
         inner_generic = linalg.GenericOp(
-            inputs=[sub_in.result],
+            inputs=[sv.result for sv in sub_inputs],
             outputs=[scratch.memref],
             body=new_body,
             indexing_maps=op.indexing_maps,
@@ -237,7 +246,7 @@ class TileLinalgPattern(RewritePattern):
         yield_op = scf.YieldOp(new_acc.res)
 
         body_block.add_ops(
-            [remaining, chunk, sub_in, scratch, inner_fill, inner_generic, new_acc, yield_op]
+            [remaining, chunk, *sub_inputs, scratch, inner_fill, inner_generic, new_acc, yield_op]
         )
 
         for_op = scf.ForOp(

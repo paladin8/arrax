@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from arrax.dsl.array import Array, amax, sum
+from arrax.dsl.array import Array, amax, dot, sum
 from arrax.dsl.tracer import trace
 from arrax.lowering.dsl_to_array import dsl_to_array
 
@@ -39,6 +39,14 @@ class TestAcceptedReductions:
 
     def test_amax_of_sub(self) -> None:
         _compile_to_array(lambda A, B: amax(A - B), {"A": (64,), "B": (64,)})
+
+    def test_bare_dot(self) -> None:
+        _compile_to_array(lambda A, B: dot(A, B), {"A": (64,), "B": (64,)})
+
+    def test_dot_of_add(self) -> None:
+        _compile_to_array(
+            lambda A, B, C: dot(A + B, C), {"A": (64,), "B": (64,), "C": (64,)}
+        )
 
 
 class TestRejectedReductions:
@@ -72,3 +80,14 @@ class TestRejectedReductions:
         root.operands = [a, m]
         with pytest.raises(ValueError, match="amax"):
             dsl_to_array(root, ["A"], {"A": (64,)})
+
+    def test_dot_fed_into_add_raises(self) -> None:
+        """A + dot(A, B) — dot has a non-root user."""
+        a = Array("A", (64,))
+        b = Array("B", (64,))
+        d = dot(a, b)
+        root = Array(name="", shape=(64,))
+        root.op = "add"
+        root.operands = [a, d]
+        with pytest.raises(ValueError, match="dot"):
+            dsl_to_array(root, ["A", "B"], {"A": (64,), "B": (64,)})

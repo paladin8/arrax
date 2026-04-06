@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from arrax.dsl.array import Array, amax, exp, relu, sum
+from arrax.dsl.array import Array, amax, dot, exp, relu, sum
 from tests.helpers import lower_to_linalg, make_module
 
 
@@ -191,6 +191,42 @@ builtin.module {
         """amax(A - B) produces one parallel generic + one reduction generic."""
         module = make_module(
             lambda A, B: amax(A - B), {"A": (64,), "B": (64,)}
+        )
+        lower_to_linalg(module)
+        ir = str(module)
+        assert ir.count("linalg.generic") == 2
+        assert '"parallel"' in ir
+        assert '"reduction"' in ir
+
+    def test_dot_lowers_to_reduction_generic(self) -> None:
+        """dot(A, B) becomes tensor.empty + linalg.fill(0.0) + mulf+addf reduction.
+
+        Two input maps (d0)->(d0), one output map (d0)->(), three body ops
+        (mulf, addf, yield).
+        """
+        module = make_module(lambda A, B: dot(A, B), {"A": (128,), "B": (128,)})
+        lower_to_linalg(module)
+        ir = str(module)
+        assert "array.dot" not in ir
+        assert "tensor.empty() : tensor<f32>" in ir
+        assert "linalg.fill" in ir
+        assert "linalg.generic" in ir
+        assert '"reduction"' in ir
+        # Body combiner: mulf + addf
+        assert "arith.mulf" in ir
+        assert "arith.addf" in ir
+        # Sink map to rank-0
+        assert "(d0) -> ()" in ir
+        # Zero identity seed
+        assert "0.000000e+00" in ir
+        # Two inputs in the generic (both tensor<128xf32>)
+        assert ir.count("tensor<128xf32>") >= 2
+
+    def test_dot_of_add_produces_two_generics(self) -> None:
+        """dot(A + B, C) produces one parallel generic + one reduction generic."""
+        module = make_module(
+            lambda A, B, C: dot(A + B, C),
+            {"A": (64,), "B": (64,), "C": (64,)},
         )
         lower_to_linalg(module)
         ir = str(module)

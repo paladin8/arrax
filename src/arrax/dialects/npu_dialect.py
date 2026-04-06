@@ -481,8 +481,86 @@ class FVMaxOp(IRDLOperation):
                     )
 
 
+@irdl_op_definition
+class FVMacOp(IRDLOperation):
+    """Chunk dot product: result = acc_in + dot(lhs[0..n], rhs[0..n]).
+
+    Maps to NPU.FVMAC (opcode=0x2B, funct7=0x01) which accumulates into
+    the hardware ``facc`` register across calls. The ``acc_in`` / ``result``
+    SSA thread is cosmetic at the IR level — the real accumulation state
+    lives in ``facc``. The asm emitter brackets the loop with FRSTACC
+    (zero before, read after) and ignores the SSA thread during the body.
+    """
+
+    name = "npu.fvmac"
+
+    lhs = operand_def(MemRefType)
+    rhs = operand_def(MemRefType)
+    n = operand_def(IndexType)
+    acc_in = operand_def(Float32Type)
+    result = result_def(Float32Type)
+
+    assembly_format = (
+        "$lhs `,` $rhs `,` $n `,` $acc_in attr-dict"
+        " `:` type($lhs) `,` type($rhs) `,` type($n) `,` type($acc_in)"
+        " `->` type($result)"
+    )
+
+    def __init__(
+        self,
+        lhs: SSAValue | Operation,
+        rhs: SSAValue | Operation,
+        n: SSAValue | Operation,
+        acc_in: SSAValue | Operation,
+    ) -> None:
+        super().__init__(
+            operands=[lhs, rhs, n, acc_in],
+            result_types=[Float32Type()],
+        )
+
+    def verify_(self) -> None:
+        lhs_type = self.lhs.type
+        rhs_type = self.rhs.type
+        if not isinstance(lhs_type, MemRefType):
+            raise VerifyException(
+                f"npu.fvmac: lhs must be a memref, got {lhs_type}"
+            )
+        if not isinstance(rhs_type, MemRefType):
+            raise VerifyException(
+                f"npu.fvmac: rhs must be a memref, got {rhs_type}"
+            )
+        if len(lhs_type.get_shape()) != 1:
+            raise VerifyException(
+                f"npu.fvmac: lhs must be rank-1 memref, got shape "
+                f"{lhs_type.get_shape()}"
+            )
+        if len(rhs_type.get_shape()) != 1:
+            raise VerifyException(
+                f"npu.fvmac: rhs must be rank-1 memref, got shape "
+                f"{rhs_type.get_shape()}"
+            )
+        if lhs_type.get_shape() != rhs_type.get_shape():
+            raise VerifyException(
+                f"npu.fvmac: lhs and rhs must have matching shapes, got "
+                f"{lhs_type.get_shape()} and {rhs_type.get_shape()}"
+            )
+        if not isinstance(lhs_type.element_type, Float32Type):
+            raise VerifyException(
+                f"npu.fvmac: expected f32 element type, got {lhs_type.element_type}"
+            )
+        if isinstance(self.n.owner, arith.ConstantOp):
+            n_attr = self.n.owner.value
+            if isinstance(n_attr, IntegerAttr):
+                n_val = n_attr.value.data
+                if n_val > NPU_MAX_VEC_LEN:
+                    raise VerifyException(
+                        f"npu.fvmac: n={n_val} exceeds NPU vector length "
+                        f"limit ({NPU_MAX_VEC_LEN})"
+                    )
+
+
 NPUDialect = Dialect(
     "npu",
-    [FVAddOp, FVSubOp, FVReluOp, FVExpOp, FVMulOp, FVDivOp, FVReduceOp, FVMaxOp],
+    [FVAddOp, FVSubOp, FVReluOp, FVExpOp, FVMulOp, FVDivOp, FVReduceOp, FVMaxOp, FVMacOp],
     [],
 )

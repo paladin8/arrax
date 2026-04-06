@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from arrax.dsl.array import Array, amax, sum
+from arrax.dsl.array import Array, amax, dot, sum
 from arrax.dsl.tracer import trace
 from arrax.lowering.dsl_to_array import dsl_to_array
 from tests.helpers import make_module
@@ -116,3 +116,23 @@ builtin.module {
         ir = str(module)
         assert "array.sub" in ir
         assert "array.amax" in ir
+
+    def test_dot_rank0_result(self) -> None:
+        """dot(A, B) produces array.dot with a rank-0 tensor<f32> result."""
+        module = make_module(lambda A, B: dot(A, B), {"A": (128,), "B": (128,)})
+        module.verify()
+        ir = str(module)
+        assert "array.dot" in ir
+        assert "tensor<f32>" in ir
+        assert "func.func @kernel(%0: tensor<128xf32>, %1: tensor<128xf32>) -> tensor<f32>" in ir
+
+    def test_dot_of_add(self) -> None:
+        """dot(A + B, C) produces array.add followed by array.dot."""
+        module = make_module(
+            lambda A, B, C: dot(A + B, C),
+            {"A": (64,), "B": (64,), "C": (64,)},
+        )
+        module.verify()
+        ir = str(module)
+        assert "array.add" in ir
+        assert "array.dot" in ir

@@ -262,8 +262,66 @@ class AmaxOp(IRDLOperation):
             )
 
 
+@irdl_op_definition
+class DotOp(IRDLOperation):
+    """Dot product: result = sum(lhs[i] * rhs[i] for i in range(n)).
+
+    Takes two rank-1 f32 tensors of matching shape and produces a rank-0
+    f32 tensor.
+    """
+
+    name = "array.dot"
+
+    lhs = operand_def(TensorType)
+    rhs = operand_def(TensorType)
+    result = result_def(TensorType)
+
+    assembly_format = (
+        "$lhs `,` $rhs attr-dict `:` type($lhs) `,` type($rhs) `->` type($result)"
+    )
+
+    traits = traits_def(Pure())
+
+    def __init__(
+        self,
+        lhs: SSAValue | Operation,
+        rhs: SSAValue | Operation,
+    ) -> None:
+        result_type = TensorType(Float32Type(), [])
+        super().__init__(operands=[lhs, rhs], result_types=[result_type])
+
+    def verify_(self) -> None:
+        lhs_type = self.lhs.type
+        rhs_type = self.rhs.type
+        result_type = self.result.type
+        assert isinstance(lhs_type, TensorType)
+        assert isinstance(rhs_type, TensorType)
+        assert isinstance(result_type, TensorType)
+        if len(lhs_type.get_shape()) != 1:
+            raise VerifyException(
+                f"array.dot: inputs must be rank-1, got lhs shape {lhs_type.get_shape()}"
+            )
+        if len(rhs_type.get_shape()) != 1:
+            raise VerifyException(
+                f"array.dot: inputs must be rank-1, got rhs shape {rhs_type.get_shape()}"
+            )
+        if lhs_type.get_shape() != rhs_type.get_shape():
+            raise VerifyException(
+                f"array.dot: inputs must have matching shapes, got "
+                f"{lhs_type.get_shape()} and {rhs_type.get_shape()}"
+            )
+        if not isinstance(lhs_type.element_type, Float32Type):
+            raise VerifyException(
+                f"array.dot: expected f32 element type, got {lhs_type.element_type}"
+            )
+        if len(result_type.get_shape()) != 0:
+            raise VerifyException(
+                f"array.dot: result must be rank-0, got shape {result_type.get_shape()}"
+            )
+
+
 ArrayDialect = Dialect(
     "array",
-    [AddOp, SubOp, ReluOp, ExpOp, MulScalarOp, DivScalarOp, SumOp, AmaxOp],
+    [AddOp, SubOp, ReluOp, ExpOp, MulScalarOp, DivScalarOp, SumOp, AmaxOp, DotOp],
     [],
 )

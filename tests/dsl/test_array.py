@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from arrax.dsl.array import Array, amax, exp, relu, sum
+import pytest
+
+from arrax.dsl.array import Array, amax, dot, exp, relu, sum
 
 
 class TestArray:
@@ -181,3 +183,40 @@ class TestArray:
         assert m.shape == ()
         inner = m.operands[0]
         assert inner.op == "sub"
+
+    def test_dot_creates_dag_node(self) -> None:
+        """dot(A, B) builds a rank-0 DAG node with two operands."""
+        a = Array("A", (1024,))
+        b = Array("B", (1024,))
+        d = dot(a, b)
+        assert d.op == "dot"
+        assert not d.is_leaf
+        assert d.shape == ()
+        assert len(d.operands) == 2
+        assert d.operands[0] is a
+        assert d.operands[1] is b
+
+    def test_dot_of_add(self) -> None:
+        """dot(A + B, C) is a rank-0 reduction of an elementwise node."""
+        a = Array("A", (100,))
+        b = Array("B", (100,))
+        c = Array("C", (100,))
+        d = dot(a + b, c)
+        assert d.op == "dot"
+        assert d.shape == ()
+        assert d.operands[0].op == "add"
+        assert d.operands[1] is c
+
+    def test_dot_shape_mismatch_raises(self) -> None:
+        """dot(A, B) raises ValueError when shapes differ."""
+        a = Array("A", (32,))
+        b = Array("B", (64,))
+        with pytest.raises(ValueError, match="shape"):
+            dot(a, b)
+
+    def test_dot_non_1d_raises(self) -> None:
+        """dot requires 1D inputs."""
+        a = Array("A", (4, 8))
+        b = Array("B", (4, 8))
+        with pytest.raises(ValueError, match="1D"):
+            dot(a, b)

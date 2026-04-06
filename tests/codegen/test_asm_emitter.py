@@ -21,7 +21,7 @@ from arrax.codegen.asm_emitter import (
     emit_assembly,
 )
 from arrax.dialects.npu_dialect import FVAddOp, FVSubOp
-from arrax.dsl.array import Array, amax, exp, relu, sum
+from arrax.dsl.array import Array, amax, dot, exp, relu, sum
 from arrax.lowering.array_to_linalg import ArrayToLinalgPass
 from arrax.lowering.bufferize import BufferizePass
 from arrax.lowering.linalg_to_npu import LinalgToNpuPass
@@ -538,6 +538,77 @@ kernel:
         asm = _to_asm_tiled(module)
         assert ".Lfor_" in asm
         assert ".insn r 0x2B, 0x0, 0x06" in asm
+
+    # --- dot (fvmac) asm emission ---
+
+    def test_dot_untiled(self) -> None:
+        """dot(A, B), N=64: FRSTACC bracket + FVMAC .insn + fsw terminal store."""
+        module = make_module(lambda A, B: dot(A, B), {"A": (64,), "B": (64,)})
+        asm = _to_asm_tiled(module)
+        # FRSTACC zero before FVMAC (funct3=0x5, funct7=0x00)
+        assert ".insn r 0x2B, 0x5, 0x00" in asm
+        # FVMAC funct7 = 0x01
+        assert ".insn r 0x2B, 0x0, 0x01" in asm
+        # Result lands in fs0 via FRSTACC read
+        assert "fs0" in asm
+        # Terminal store to the rank-0 output memref (a2)
+        assert "fsw fs0, 0(a2)" in asm
+
+    def test_dot_untiled_small(self) -> None:
+        module = make_module(lambda A, B: dot(A, B), {"A": (16,), "B": (16,)})
+        asm = _to_asm_tiled(module)
+        assert ".insn r 0x2B, 0x0, 0x01" in asm
+        assert "fsw fs0, 0(a2)" in asm
+
+    def test_dot_untiled_frstacc_bracket(self) -> None:
+        """Untiled dot: FRSTACC zero appears before FVMAC, FRSTACC read after."""
+        module = make_module(lambda A, B: dot(A, B), {"A": (32,), "B": (32,)})
+        asm = _to_asm_tiled(module)
+        lines = asm.splitlines()
+        # Find FRSTACC and FVMAC instruction lines
+        frstacc_lines = [i for i, l in enumerate(lines) if ".insn r 0x2B, 0x5, 0x00" in l]
+        fvmac_lines = [i for i, l in enumerate(lines) if ".insn r 0x2B, 0x0, 0x01" in l]
+        assert len(frstacc_lines) == 2, f"expected 2 FRSTACC, got {frstacc_lines}"
+        assert len(fvmac_lines) == 1, f"expected 1 FVMAC, got {fvmac_lines}"
+        # FRSTACC zero < FVMAC < FRSTACC read
+        assert frstacc_lines[0] < fvmac_lines[0] < frstacc_lines[1]
+
+    def test_dot_tiled(self) -> None:
+        """dot(A, B), N=128: FRSTACC zero before loop, FVMAC inside, FRSTACC read after."""
+        module = make_module(lambda A, B: dot(A, B), {"A": (128,), "B": (128,)})
+        asm = _to_asm_tiled(module)
+        assert ".Lfor_" in asm
+        assert ".insn r 0x2B, 0x0, 0x01" in asm  # FVMAC
+        assert "fsw fs0, 0(a2)" in asm
+        # FRSTACC zero before the loop label
+        pre_loop = asm.split(".Lfor_")[0]
+        assert ".insn r 0x2B, 0x5, 0x00" in pre_loop
+        # FRSTACC read + terminal store after the loop
+        post_loop = asm.split(".Lfor_end")[-1]
+        assert ".insn r 0x2B, 0x5, 0x00" in post_loop
+        assert "fsw fs0, 0(a2)" in post_loop
+
+    def test_dot_tiled_no_fadd_combine(self) -> None:
+        """Tiled dot does NOT use fadd.s or fmax.s combine — facc accumulates directly."""
+        module = make_module(lambda A, B: dot(A, B), {"A": (128,), "B": (128,)})
+        asm = _to_asm_tiled(module)
+        assert "fadd.s" not in asm
+        assert "fmax.s" not in asm
+
+    def test_dot_non_multiple(self) -> None:
+        """dot(A, B), N=100: remainder handled."""
+        module = make_module(lambda A, B: dot(A, B), {"A": (100,), "B": (100,)})
+        asm = _to_asm_tiled(module)
+        assert ".Lfor_" in asm
+        assert ".insn r 0x2B, 0x0, 0x01" in asm
+        assert "fsw fs0, 0(a2)" in asm
+
+    def test_dot_large(self) -> None:
+        """dot(A, B), N=1024."""
+        module = make_module(lambda A, B: dot(A, B), {"A": (1024,), "B": (1024,)})
+        asm = _to_asm_tiled(module)
+        assert ".Lfor_" in asm
+        assert ".insn r 0x2B, 0x0, 0x01" in asm
 
 
 class TestScalarFPRegisterPool:

@@ -10,6 +10,7 @@ from arrax.dialects.array_dialect import (
     AddOp,
     AmaxOp,
     DivScalarOp,
+    DotOp,
     ExpOp,
     MulScalarOp,
     ReluOp,
@@ -155,6 +156,12 @@ def dsl_to_array(
             amax_op = AmaxOp(operand)
             entry_block.add_op(amax_op)
             val = amax_op.result
+        elif node.op == "dot":
+            lhs = lower(node.operands[0])
+            rhs = lower(node.operands[1])
+            dot_op = DotOp(lhs, rhs)
+            entry_block.add_op(dot_op)
+            val = dot_op.result
         else:
             raise ValueError(f"unsupported operation: {node.op}")
 

@@ -8,7 +8,7 @@ import numpy as np
 from riscv_npu import Emulator
 
 from arrax.codegen.build import build_elf
-from arrax.dsl.array import Array, amax, exp, relu
+from arrax.dsl.array import Array, amax, dot, exp, relu
 from arrax.dsl.array import sum as arr_sum
 from arrax.pipeline import compile_to_asm
 
@@ -663,6 +663,83 @@ class TestEndToEnd:
             tmp_path,
         )
         assert np.isnan(actual), f"expected NaN, got {actual!r}"
+
+    def test_dot_small(self, tmp_path: Path) -> None:
+        """dot(A, B) with N=16: untiled dot product."""
+        N = 16
+        A = np.arange(N, dtype=np.float32)
+        B = np.ones(N, dtype=np.float32) * 2.0
+        expected = float(np.dot(A, B))
+
+        actual, _ = _compile_and_run_scalar(
+            lambda A, B: dot(A, B),
+            {"A": (N,), "B": (N,)},
+            {"A": A, "B": B},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-5)
+
+    def test_dot_exact_tile(self, tmp_path: Path) -> None:
+        """dot(A, B) with N=64: exact one-tile untiled dot product."""
+        N = 64
+        A = np.linspace(-1.0, 1.0, N, dtype=np.float32)
+        B = np.linspace(0.0, 2.0, N, dtype=np.float32)
+        expected = float(np.dot(A, B))
+
+        actual, _ = _compile_and_run_scalar(
+            lambda A, B: dot(A, B),
+            {"A": (N,), "B": (N,)},
+            {"A": A, "B": B},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-5)
+
+    def test_dot_non_multiple(self, tmp_path: Path) -> None:
+        """dot(A, B) with N=100: tiled dot with remainder chunk."""
+        N = 100
+        A = np.arange(N, dtype=np.float32) * 0.1
+        B = np.ones(N, dtype=np.float32)
+        expected = float(np.dot(A, B))
+
+        actual, _ = _compile_and_run_scalar(
+            lambda A, B: dot(A, B),
+            {"A": (N,), "B": (N,)},
+            {"A": A, "B": B},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-4)
+
+    def test_dot_large(self, tmp_path: Path) -> None:
+        """dot(A, B) with N=1024: many tiled iterations."""
+        N = 1024
+        A = np.ones(N, dtype=np.float32) * 0.5
+        B = np.ones(N, dtype=np.float32) * 2.0
+        expected = float(np.dot(A, B))  # 1024.0
+
+        actual, _ = _compile_and_run_scalar(
+            lambda A, B: dot(A, B),
+            {"A": (N,), "B": (N,)},
+            {"A": A, "B": B},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-4)
+
+    def test_dot_orthogonal(self, tmp_path: Path) -> None:
+        """dot of orthogonal vectors is zero."""
+        N = 64
+        A = np.zeros(N, dtype=np.float32)
+        A[0] = 1.0
+        B = np.zeros(N, dtype=np.float32)
+        B[1] = 1.0
+        expected = 0.0
+
+        actual, _ = _compile_and_run_scalar(
+            lambda A, B: dot(A, B),
+            {"A": (N,), "B": (N,)},
+            {"A": A, "B": B},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, atol=1e-7)
 
     def test_reports_cycles(self, tmp_path: Path) -> None:
         """Emulator reports nonzero cycle count."""

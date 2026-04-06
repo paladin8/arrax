@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from arrax.dsl.array import Array, amax, sum
+from arrax.dsl.array import Array, amax, dot, sum
 from arrax.dsl.tracer import trace
 
 
@@ -104,3 +104,24 @@ class TestTrace:
         assert result.shape == ()
         inner = result.operands[0]
         assert inner.op == "sub"
+
+    def test_trace_dot(self) -> None:
+        """dot(A, B) produces a rank-0 root node with two operands."""
+        result, params = trace(lambda A, B: dot(A, B), {"A": (128,), "B": (128,)})
+        assert params == ["A", "B"]
+        assert result.op == "dot"
+        assert result.shape == ()
+        assert len(result.operands) == 2
+        assert result.operands[0].is_leaf
+        assert result.operands[1].is_leaf
+
+    def test_trace_dot_of_add(self) -> None:
+        """dot(A + B, A - B) produces a rank-0 root with elementwise inputs."""
+        result, params = trace(
+            lambda A, B: dot(A + B, A - B), {"A": (64,), "B": (64,)}
+        )
+        assert params == ["A", "B"]
+        assert result.op == "dot"
+        assert result.shape == ()
+        assert result.operands[0].op == "add"
+        assert result.operands[1].op == "sub"

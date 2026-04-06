@@ -5,7 +5,7 @@ from __future__ import annotations
 from xdsl.context import Context
 from xdsl.dialects.builtin import ModuleOp
 
-from arrax.dsl.array import Array, amax, exp, relu, sum
+from arrax.dsl.array import Array, amax, dot, exp, relu, sum
 
 from arrax.lowering.array_to_linalg import ArrayToLinalgPass
 from arrax.lowering.bufferize import BufferizePass
@@ -391,5 +391,65 @@ builtin.module {
         """Verifier passes for both tiled and untiled amax."""
         for n in (16, 64, 100, 128, 1024):
             module = make_module(lambda A: amax(A), {"A": (n,)})
+            _lower_to_npu_with_tiling(module)
+            module.verify()
+
+    # --- reduction lowering (dot) ---
+
+    def test_dot_untiled_basic(self) -> None:
+        """dot(A, B), n=64: fill+generic collapse to npu.fvmac + store."""
+        module = make_module(lambda A, B: dot(A, B), {"A": (64,), "B": (64,)})
+        _lower_to_npu(module)
+        ir = str(module)
+        assert "npu.fvmac" in ir
+        assert "linalg.generic" not in ir
+        assert "linalg.fill" not in ir
+        assert "memref.store" in ir
+        assert "arith.constant 64 : index" in ir
+
+    def test_dot_untiled_small(self) -> None:
+        module = make_module(lambda A, B: dot(A, B), {"A": (16,), "B": (16,)})
+        _lower_to_npu(module)
+        ir = str(module)
+        assert "npu.fvmac" in ir
+        assert "linalg.generic" not in ir
+        assert "arith.constant 16 : index" in ir
+
+    def test_dot_untiled_acc_is_zero(self) -> None:
+        """Untiled dot threads acc_in = arith.constant 0.0."""
+        module = make_module(lambda A, B: dot(A, B), {"A": (32,), "B": (32,)})
+        _lower_to_npu(module)
+        ir = str(module)
+        assert "arith.constant 0.000000e+00 : f32" in ir
+        assert "npu.fvmac" in ir
+
+    def test_dot_tiled_basic(self) -> None:
+        """dot(A, B), n=128: fvmac inside scf.for body, alloca erased."""
+        module = make_module(lambda A, B: dot(A, B), {"A": (128,), "B": (128,)})
+        _lower_to_npu_with_tiling(module)
+        ir = str(module)
+        assert "npu.fvmac" in ir
+        assert "scf.for" in ir
+        assert "iter_args" in ir
+        assert "linalg.generic" not in ir
+        assert "linalg.fill" not in ir
+        assert "memref.alloca" not in ir
+        assert "memref.load" not in ir
+        assert "memref.store" in ir
+        assert "arith.minsi" in ir
+
+    def test_dot_tiled_non_multiple(self) -> None:
+        """dot(A, B), n=100: fvmac tolerates the remainder chunk."""
+        module = make_module(lambda A, B: dot(A, B), {"A": (100,), "B": (100,)})
+        _lower_to_npu_with_tiling(module)
+        ir = str(module)
+        assert "npu.fvmac" in ir
+        assert "scf.for" in ir
+        assert "linalg.generic" not in ir
+
+    def test_dot_verifies(self) -> None:
+        """Verifier passes for both tiled and untiled dot."""
+        for n in (16, 64, 100, 128, 1024):
+            module = make_module(lambda A, B: dot(A, B), {"A": (n,), "B": (n,)})
             _lower_to_npu_with_tiling(module)
             module.verify()
