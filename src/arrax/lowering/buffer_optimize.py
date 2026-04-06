@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from xdsl.context import Context
-from xdsl.dialects import arith, func, memref, scf
+from xdsl.dialects import arith, func, linalg, memref, scf
 from xdsl.dialects.builtin import (
     DYNAMIC_INDEX,
     IndexType,
@@ -125,6 +125,22 @@ def _liveness_interval(
             idx = _op_index(loop_body, user)
             first = min(first, idx)
             last = max(last, idx)
+            # Guard against NPU binary-op aliasing hazard.
+            # NPU binary ops copy ins[1] into dst, then compute
+            # dst = ins[0] OP dst.  If ins[0] and dst alias (because
+            # buffer reuse merges the two allocs), the copy destroys
+            # ins[0].  Extend the interval by 1 past such ops so
+            # the alloc won't be merged with the output buffer.
+            # The +1 is sufficient because the consuming op (which
+            # starts the next buffer's interval) is always the
+            # immediate user of the binary op's output in fused
+            # loop bodies — there are no intervening ops.
+            if (
+                isinstance(user, linalg.GenericOp)
+                and len(list(user.inputs)) >= 2
+                and sv.result is list(user.inputs)[0]
+            ):
+                last = max(last, idx + 1)
     assert first <= last, "alloc has subview uses but no transitive users"
     return (first, last)
 

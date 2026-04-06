@@ -797,6 +797,107 @@ class TestEndToEnd:
         )
         np.testing.assert_allclose(actual, expected, rtol=1e-4)
 
+    # --- fused reduction + elementwise ---
+
+    def test_sum_of_add(self, tmp_path: Path) -> None:
+        """sum(A + B): fused parallel + reduction."""
+        N = 128
+        A = np.arange(N, dtype=np.float32)
+        B = np.ones(N, dtype=np.float32) * 0.5
+        expected = float((A + B).sum())
+
+        actual, _ = _compile_and_run_scalar(
+            lambda A, B: arr_sum(A + B),
+            {"A": (N,), "B": (N,)},
+            {"A": A, "B": B},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-5)
+
+    def test_sum_of_relu(self, tmp_path: Path) -> None:
+        """sum(relu(A)): fused unary + reduction."""
+        N = 128
+        A = np.linspace(-5.0, 5.0, N, dtype=np.float32)
+        expected = float(np.maximum(A, 0.0).sum())
+
+        actual, _ = _compile_and_run_scalar(
+            lambda A: arr_sum(relu(A)),
+            {"A": (N,)},
+            {"A": A},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-5)
+
+    def test_amax_of_sub(self, tmp_path: Path) -> None:
+        """amax(A - B): fused binary + max reduction."""
+        N = 128
+        A = np.arange(N, dtype=np.float32)
+        B = np.ones(N, dtype=np.float32) * 50.0
+        expected = float((A - B).max())
+
+        actual, _ = _compile_and_run_scalar(
+            lambda A, B: amax(A - B),
+            {"A": (N,), "B": (N,)},
+            {"A": A, "B": B},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-5)
+
+    def test_dot_of_add(self, tmp_path: Path) -> None:
+        """dot(A + B, C): fused parallel + dot reduction."""
+        N = 128
+
+        def kernel(A: Array, B: Array, C: Array) -> Array:
+            return dot(A + B, C)
+
+        A = np.arange(N, dtype=np.float32) * 0.1
+        B = np.ones(N, dtype=np.float32)
+        C = np.ones(N, dtype=np.float32) * 2.0
+        expected = float(np.dot(A + B, C))
+
+        actual, _ = _compile_and_run_scalar(
+            kernel,
+            {"A": (N,), "B": (N,), "C": (N,)},
+            {"A": A, "B": B, "C": C},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-4)
+
+    def test_mean_of_chain(self, tmp_path: Path) -> None:
+        """mean((A + B) - C): fused chain + mean reduction."""
+        N = 128
+
+        def kernel(A: Array, B: Array, C: Array) -> Array:
+            return mean((A + B) - C)
+
+        A = np.arange(N, dtype=np.float32)
+        B = np.ones(N, dtype=np.float32) * 10.0
+        C = np.ones(N, dtype=np.float32) * 3.0
+        expected = float(((A + B) - C).mean())
+
+        actual, _ = _compile_and_run_scalar(
+            kernel,
+            {"A": (N,), "B": (N,), "C": (N,)},
+            {"A": A, "B": B, "C": C},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-4)
+
+    def test_dot_scalar_vec_no_fuse_correct(self, tmp_path: Path) -> None:
+        """dot(A * 2.0, B): facc conflict prevents fusion, but result is correct."""
+        N = 128
+        A = np.arange(N, dtype=np.float32) * 0.1
+        B = np.ones(N, dtype=np.float32)
+        expected = float(np.dot(A * 2.0, B))
+
+        actual, _ = _compile_and_run_scalar(
+            lambda A, B: dot(A * 2.0, B),
+            {"A": (N,), "B": (N,)},
+            {"A": A, "B": B},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-4)
+
     def test_reports_cycles(self, tmp_path: Path) -> None:
         """Emulator reports nonzero cycle count."""
         N = 16

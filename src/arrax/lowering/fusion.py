@@ -3,7 +3,19 @@
 Post-tiling, each elementwise op becomes its own scf.for loop. When two
 loops iterate over the same range and the second consumes data produced
 by the first, they can be fused into a single loop — reducing loop overhead
-and enabling buffer optimizations (Phase 4).
+and enabling buffer optimizations.
+
+Two fusion cases are handled:
+  1. Parallel + parallel (M2): both loops have no iter_args. The second
+     loop's body is appended to the first loop's body.
+  2. Parallel + reduction (M3): the first loop has no iter_args, the second
+     carries iter_args (scalar f32 accumulator). The first loop's body is
+     spliced before the second loop's body; the second loop (with iter_args)
+     survives.
+
+A facc conflict guard prevents fusing two loops that both contain ops
+tagged ``arrax.uses_facc`` (set by ArrayToLinalg for ops that require
+exclusive use of the hardware facc register).
 
 Pipeline placement: after Tile, before LinalgToNpu.
 """
@@ -13,7 +25,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from xdsl.context import Context
-from xdsl.dialects import arith, memref, scf
+from xdsl.dialects import arith, linalg, memref, scf
 from xdsl.dialects.builtin import IntegerAttr, ModuleOp
 from xdsl.ir import Block, Operation, SSAValue
 from xdsl.passes import ModulePass
@@ -134,6 +146,76 @@ def _cse_body(block: Block) -> None:
         op.erase()
 
 
+def _fuse_parallel_into_reduction(
+    parallel: scf.ForOp, reduction: scf.ForOp
+) -> None:
+    """Merge a parallel (no iter_args) loop's body into a reduction loop.
+
+    The parallel body is spliced before the reduction body. The reduction
+    loop survives with its iter_args intact. The parallel loop is erased.
+    """
+    par_body = parallel.body.blocks.first
+    red_body = reduction.body.blocks.first
+    assert par_body is not None
+    assert red_body is not None
+
+    # Collect parallel loop's bound constants before remapping.
+    bound_consts: list[arith.ConstantOp] = []
+    for val in [parallel.lb, parallel.ub, parallel.step]:
+        if isinstance(val.owner, arith.ConstantOp):
+            bound_consts.append(val.owner)
+
+    # Remap: parallel IV → reduction IV
+    par_body.args[0].replace_all_uses_with(red_body.args[0])
+
+    # Remap bounds: parallel's lb/ub/step → reduction's
+    parallel.lb.replace_all_uses_with(reduction.lb)
+    parallel.ub.replace_all_uses_with(reduction.ub)
+    parallel.step.replace_all_uses_with(reduction.step)
+
+    # Collect parallel body ops (skip yield)
+    ops_to_move = [op for op in par_body.ops if not isinstance(op, scf.YieldOp)]
+
+    # Insert at the top of the reduction body (before first existing op)
+    first_red_op = red_body.first_op
+    for op in ops_to_move:
+        op.detach()
+        red_body.insert_op_before(op, first_red_op)
+
+    # CSE: deduplicate subi/minsi/subview pairs that now have identical operands.
+    _cse_body(red_body)
+
+    # Erase the parallel loop.
+    parallel.detach()
+    parallel.erase()
+
+    # Clean up dead bound constants.
+    for op in bound_consts:
+        if not op.result.uses:
+            op.detach()
+            op.erase()
+
+
+def _has_facc_conflict(first: scf.ForOp, second: scf.ForOp) -> bool:
+    """Check if fusing would create a facc register conflict.
+
+    Ops tagged with the ``arrax.uses_facc`` discardable attribute (set by
+    ArrayToLinalg) require exclusive use of the hardware facc register.
+    If both loops contain such ops, fusing them would corrupt facc.
+    """
+    def _uses_facc(loop: scf.ForOp) -> bool:
+        body = loop.body.blocks.first
+        if body is None:
+            return False
+        return any(
+            isinstance(op, linalg.GenericOp)
+            and "arrax.uses_facc" in op.attributes
+            for op in body.ops
+        )
+
+    return _uses_facc(first) and _uses_facc(second)
+
+
 def _fuse_block(block: Block) -> bool:
     """Fuse adjacent scf.for loops in a block. Returns True if any fusion happened."""
     fused = False
@@ -156,22 +238,34 @@ def _fuse_block(block: Block) -> bool:
                 continue
             if not _same_bounds(first, second):
                 continue
-            # Safety: refuse to fuse if either loop carries iter_args.
-            # Parallel→reduction fusion (matching bounds, different iter_arg
-            # shapes) lands in Phase 5; Phase 1 must not silently merge a
-            # parallel elementwise loop with a reduction loop whose
-            # iter_args and scf.yield would be dropped on the floor.
-            if first.iter_args or second.iter_args:
-                continue
-            # Hoist any alloc ops between the loops to before first
-            for k in range(i + 1, j):
-                if isinstance(ops[k], memref.AllocOp):
-                    ops[k].detach()
-                    block.insert_op_before(ops[k], first)
-            _fuse_loops(first, second)
-            changed = True
-            fused = True
-            break
+
+            # Case 1: both parallel (no iter_args) — M2 parallel-parallel fusion.
+            if not first.iter_args and not second.iter_args:
+                for k in range(i + 1, j):
+                    if isinstance(ops[k], memref.AllocOp):
+                        ops[k].detach()
+                        block.insert_op_before(ops[k], first)
+                _fuse_loops(first, second)
+                changed = True
+                fused = True
+                break
+
+            # Case 2: parallel → reduction fusion.
+            # First has no iter_args, second carries iter_args.
+            if not first.iter_args and second.iter_args:
+                if _has_facc_conflict(first, second):
+                    continue
+                for k in range(i + 1, j):
+                    if isinstance(ops[k], memref.AllocOp):
+                        ops[k].detach()
+                        block.insert_op_before(ops[k], first)
+                _fuse_parallel_into_reduction(first, second)
+                changed = True
+                fused = True
+                break
+
+            # Other iter_args combinations (reduction→parallel, reduction→reduction)
+            # are not fused in M3.
     return fused
 
 

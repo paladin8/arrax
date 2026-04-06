@@ -542,6 +542,37 @@ class _AsmEmitter:
                 # Yielded value must be materializable (e.g. an f32 constant).
                 self._materialize_f32_into(yield_val, target_reg)
 
+    def _bind_reduction_acc(
+        self,
+        acc_in: SSAValue,
+        result: SSAValue,
+        *,
+        materialize: bool = True,
+    ) -> str:
+        """Allocate/lookup the pooled register for a reduction accumulator.
+
+        ``acc_in`` comes either from an iter_arg (already in the pool) or a
+        bare f32 constant (untiled N<=64 case). For the latter, allocate a
+        pool register and optionally materialize the initial value.
+
+        IMPORTANT: call this BEFORE loading ``n`` into ``t0`` —
+        materialization uses ``t0`` as scratch for IEEE bits and would
+        otherwise clobber the loaded element count.
+
+        For FVMacOp, pass ``materialize=False`` since facc holds the real
+        accumulator state; the pool register is cosmetic.
+
+        Returns the fs-register name.
+        """
+        if self._fp_pool.contains(acc_in):
+            acc_reg = self._fp_pool.get(acc_in)
+        else:
+            acc_reg = self._fp_pool.allocate(acc_in)
+            if materialize:
+                self._materialize_f32_into(acc_in, acc_reg)
+        self._fp_pool.bind(result, acc_reg)
+        return acc_reg
+
     def _emit_fv_reduce(self, op: FVReduceOp) -> None:
         """Emit NPU.FVREDUCE + fadd.s into the pooled accumulator register.
 
@@ -551,19 +582,7 @@ class _AsmEmitter:
         so subsequent ops read the updated accumulator without extra moves.
         """
         src = self._reg(op.src)
-
-        # Acc_in comes either from an iter_arg (already in the pool) or a
-        # bare f32 constant (e.g. untiled N<=64 case); for the latter we
-        # must allocate a pool register and materialize it now. Do this
-        # BEFORE loading n into t0: materialization uses t0 as a scratch
-        # for the IEEE bits and would otherwise clobber the loaded n.
-        if self._fp_pool.contains(op.acc_in):
-            acc_reg = self._fp_pool.get(op.acc_in)
-        else:
-            acc_reg = self._fp_pool.allocate(op.acc_in)
-            self._materialize_f32_into(op.acc_in, acc_reg)
-        # The result SSA value aliases the accumulator register in-place.
-        self._fp_pool.bind(op.result, acc_reg)
+        acc_reg = self._bind_reduction_acc(op.acc_in, op.result)
 
         # Resolve n: either a constant (static shape) or a known register.
         n_is_const = id(op.n) in self._const_map
@@ -597,16 +616,7 @@ class _AsmEmitter:
         NaN-propagating ``fmax.s`` — matching NPU FVMAX semantics.
         """
         src = self._reg(op.src)
-
-        # Materialize acc_in into a pool register if needed. Do this BEFORE
-        # loading n into t0, since materialization uses t0 as scratch for
-        # the IEEE bits and would otherwise clobber the element count.
-        if self._fp_pool.contains(op.acc_in):
-            acc_reg = self._fp_pool.get(op.acc_in)
-        else:
-            acc_reg = self._fp_pool.allocate(op.acc_in)
-            self._materialize_f32_into(op.acc_in, acc_reg)
-        self._fp_pool.bind(op.result, acc_reg)
+        acc_reg = self._bind_reduction_acc(op.acc_in, op.result)
 
         n_is_const = id(op.n) in self._const_map
         if n_is_const:
@@ -648,13 +658,7 @@ class _AsmEmitter:
         """
         lhs = self._reg(op.lhs)
         rhs = self._reg(op.rhs)
-
-        # Pool register handling: bind result to the same register as acc_in.
-        if self._fp_pool.contains(op.acc_in):
-            acc_reg = self._fp_pool.get(op.acc_in)
-        else:
-            acc_reg = self._fp_pool.allocate(op.acc_in)
-        self._fp_pool.bind(op.result, acc_reg)
+        acc_reg = self._bind_reduction_acc(op.acc_in, op.result, materialize=False)
 
         # Check if inside a tiled loop (facc persists across iterations).
         in_loop = isinstance(op.parent_op(), scf.ForOp)

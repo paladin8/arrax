@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from arrax.dsl.array import Array, exp, relu
+from arrax.dsl.array import Array, amax, dot, exp, mean, relu
 from arrax.dsl.array import sum as arr_sum
 from tests.helpers import fuse, make_module, tile
 
@@ -58,22 +58,111 @@ class TestFusion:
         assert ir.count("scf.for") == 1
         assert ir.count("linalg.generic") == 1
 
-    def test_parallel_reduction_not_fused(self) -> None:
-        """sum(A + B) at N > 64: an iter_args-free parallel loop must NOT
-        fuse with an iter_args-carrying reduction loop. Parallel→reduction
-        fusion is Phase 5 work; Phase 1 must leave the two loops intact
-        rather than merging them and dropping the reduction yield.
-        """
+    def test_sum_of_add_fuses(self) -> None:
+        """sum(A + B): parallel loop fuses into reduction loop."""
         module = make_module(
             lambda A, B: arr_sum(A + B), {"A": (128,), "B": (128,)}
         )
         fuse(module)
         module.verify()
         ir = str(module)
-        # Two loops remain: one parallel (A+B) and one reduction (sum).
-        assert ir.count("scf.for") == 2
-        # The reduction loop still carries its iter_args.
+        assert ir.count("scf.for") == 1
         assert "iter_args" in ir
+        assert ir.count("linalg.generic") == 2
+
+    def test_sum_of_relu_fuses(self) -> None:
+        """sum(relu(A)): unary parallel + reduction fuse."""
+        module = make_module(lambda A: arr_sum(relu(A)), {"A": (128,)})
+        fuse(module)
+        module.verify()
+        ir = str(module)
+        assert ir.count("scf.for") == 1
+        assert "iter_args" in ir
+
+    def test_dot_of_add_fuses(self) -> None:
+        """dot(A + B, C): parallel + dot reduction fuse."""
+        module = make_module(
+            lambda A, B, C: dot(A + B, C),
+            {"A": (128,), "B": (128,), "C": (128,)},
+        )
+        fuse(module)
+        module.verify()
+        ir = str(module)
+        assert ir.count("scf.for") == 1
+        assert "iter_args" in ir
+
+    def test_amax_of_sub_fuses(self) -> None:
+        """amax(A - B): parallel + max reduction fuse."""
+        module = make_module(
+            lambda A, B: amax(A - B), {"A": (128,), "B": (128,)}
+        )
+        fuse(module)
+        module.verify()
+        ir = str(module)
+        assert ir.count("scf.for") == 1
+        assert "iter_args" in ir
+
+    def test_mean_of_chain_fuses(self) -> None:
+        """mean((A + B) - C): two parallel fuse first, then fuse into reduction."""
+        def kernel(A: Array, B: Array, C: Array) -> Array:
+            return mean((A + B) - C)
+
+        module = make_module(kernel, {"A": (128,), "B": (128,), "C": (128,)})
+        fuse(module)
+        module.verify()
+        ir = str(module)
+        assert ir.count("scf.for") == 1
+        assert "iter_args" in ir
+        assert ir.count("linalg.generic") == 3
+
+    def test_facc_conflict_dot_scalar_not_fused(self) -> None:
+        """dot(A * 2.0, B): scalar-vector uses facc, dot uses facc — skip fusion."""
+        module = make_module(
+            lambda A, B: dot(A * 2.0, B), {"A": (128,), "B": (128,)}
+        )
+        fuse(module)
+        module.verify()
+        ir = str(module)
+        # Two loops remain: scalar-vector parallel + dot reduction
+        assert ir.count("scf.for") == 2
+
+    def test_facc_conflict_div_scalar_not_fused(self) -> None:
+        """dot(A / 2.0, B): div-scalar also uses facc — skip fusion."""
+        module = make_module(
+            lambda A, B: dot(A / 2.0, B), {"A": (128,), "B": (128,)}
+        )
+        fuse(module)
+        module.verify()
+        ir = str(module)
+        assert ir.count("scf.for") == 2
+
+    def test_facc_conflict_non_dot_ok(self) -> None:
+        """sum(A * 2.0): scalar-vector + sum is safe (fvreduce doesn't use facc)."""
+        module = make_module(lambda A: arr_sum(A * 2.0), {"A": (128,)})
+        fuse(module)
+        module.verify()
+        ir = str(module)
+        assert ir.count("scf.for") == 1
+        assert "iter_args" in ir
+
+    def test_facc_tag_present_after_tile(self) -> None:
+        """arrax.uses_facc attribute survives through bufferize + tile."""
+        module = make_module(
+            lambda A, B: dot(A * 2.0, B), {"A": (128,), "B": (128,)}
+        )
+        tile(module)
+        ir = str(module)
+        assert ir.count("arrax.uses_facc") >= 2  # scalar-vec + dot
+
+    def test_parallel_reduction_fusion_untiled_no_op(self) -> None:
+        """sum(A + B) at N=32: no tiling, no loops, nothing to fuse."""
+        module = make_module(
+            lambda A, B: arr_sum(A + B), {"A": (32,), "B": (32,)}
+        )
+        fuse(module)
+        module.verify()
+        ir = str(module)
+        assert "scf.for" not in ir
 
     def test_cse_deduplicates_subi_minsi(self) -> None:
         """After fusion, redundant subi/minsi pairs are eliminated."""

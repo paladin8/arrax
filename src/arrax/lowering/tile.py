@@ -36,6 +36,8 @@ from xdsl.dialects.builtin import (
 from xdsl.dialects.linalg import IteratorType
 from xdsl.ir import Block, Region, SSAValue
 from xdsl.passes import ModulePass
+
+from arrax.lowering.utils import find_preceding_fill
 from xdsl.pattern_rewriter import (
     GreedyRewritePatternApplier,
     PatternRewriter,
@@ -139,6 +141,10 @@ class TileLinalgPattern(RewritePattern):
             iterator_types=op.iterator_types,
             result_types=[],
         )
+        # Preserve discardable attributes (e.g. arrax.uses_facc).
+        for name, attr in op.attributes.items():
+            if name not in new_generic.attributes:
+                new_generic.attributes[name] = attr
 
         yield_op = scf.YieldOp()
 
@@ -191,7 +197,7 @@ class TileLinalgPattern(RewritePattern):
         # Find the preceding linalg.fill that seeds the output; its scalar
         # input becomes the iter_args init. Raise if absent — the array->
         # linalg pattern always emits one.
-        init_fill = _find_init_fill(op, out_memref)
+        init_fill = find_preceding_fill(op, out_memref)
         if init_fill is None:
             return
         init_val = list(init_fill.inputs)[0]
@@ -271,21 +277,6 @@ class TileLinalgPattern(RewritePattern):
         )
 
 
-def _find_init_fill(
-    generic: linalg.GenericOp, out_memref: SSAValue
-) -> linalg.FillOp | None:
-    """Walk backwards in the parent block for the fill that seeds the output."""
-    parent = generic.parent
-    if parent is None:
-        return None
-    cur = generic.prev_op
-    while cur is not None:
-        if isinstance(cur, linalg.FillOp):
-            for o in cur.outputs:
-                if o is out_memref:
-                    return cur
-        cur = cur.prev_op
-    return None
 
 
 @dataclass(frozen=True)

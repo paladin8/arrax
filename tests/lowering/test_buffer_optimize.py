@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from arrax.dsl.array import Array, relu
+from arrax.dsl.array import Array, amax, relu
+from arrax.dsl.array import sum as arr_sum
 from tests.helpers import fuse, make_module, optimize_buffers
 
 
@@ -135,5 +136,54 @@ class TestBufferReuse:
             return relu(A + B) - C
 
         module = make_module(kernel, {"A": (128,), "B": (128,), "C": (128,)})
+        optimize_buffers(module)
+        module.verify()
+
+    def test_binary_op_aliasing_no_reuse(self) -> None:
+        """sum((A + B) - C): add and sub intermediates must NOT share a buffer.
+
+        The NPU binary sub copies ins[1] (C) into dst before computing
+        dst = ins[0] - dst. If ins[0] and dst alias (same buffer), the
+        copy destroys ins[0]. Two intermediate allocs must survive.
+        """
+        def kernel(A: Array, B: Array, C: Array) -> Array:
+            return arr_sum((A + B) - C)
+
+        module = make_module(kernel, {"A": (128,), "B": (128,), "C": (128,)})
+        optimize_buffers(module)
+        ir = str(module)
+        # Two tile-sized allocs (add output + sub output), not merged
+        assert ir.count("memref.alloc() : memref<64xf32>") == 2
+        module.verify()
+
+
+class TestBufferOptimizeFusedReduction:
+    def test_sum_of_add_intermediate_shrinks(self) -> None:
+        """sum(A + B): after fusion, intermediate buffer shrinks to 64."""
+        module = make_module(
+            lambda A, B: arr_sum(A + B), {"A": (128,), "B": (128,)}
+        )
+        optimize_buffers(module)
+        ir = str(module)
+        assert ir.count("scf.for") == 1
+        assert "memref.alloc() : memref<64xf32>" in ir
+        assert "memref.alloc() : memref<128xf32>" not in ir
+
+    def test_amax_of_sub_intermediate_shrinks(self) -> None:
+        """amax(A - B): after fusion, intermediate shrinks."""
+        module = make_module(
+            lambda A, B: amax(A - B), {"A": (128,), "B": (128,)}
+        )
+        optimize_buffers(module)
+        module.verify()
+        ir = str(module)
+        assert ir.count("scf.for") == 1
+        assert "memref.alloc() : memref<128xf32>" not in ir
+
+    def test_fused_reduction_verifies(self) -> None:
+        """Post-fusion buffer-optimized reduction IR passes verification."""
+        module = make_module(
+            lambda A, B: arr_sum(A + B), {"A": (128,), "B": (128,)}
+        )
         optimize_buffers(module)
         module.verify()

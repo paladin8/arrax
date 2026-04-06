@@ -175,8 +175,10 @@ class DivScalarOp(IRDLOperation):
 
 def _verify_rank1_to_rank0_f32(op_name: str, input_type: object, result_type: object) -> None:
     """Shared verifier for unary reduction ops (rank-1 f32 -> rank-0 f32)."""
-    assert isinstance(input_type, TensorType)
-    assert isinstance(result_type, TensorType)
+    if not isinstance(input_type, TensorType):
+        raise VerifyException(f"{op_name}: input must be a tensor, got {input_type}")
+    if not isinstance(result_type, TensorType):
+        raise VerifyException(f"{op_name}: result must be a tensor, got {result_type}")
     if len(input_type.get_shape()) != 1:
         raise VerifyException(
             f"{op_name}: input must be rank-1, got shape {input_type.get_shape()}"
@@ -278,9 +280,12 @@ class DotOp(IRDLOperation):
         lhs_type = self.lhs.type
         rhs_type = self.rhs.type
         result_type = self.result.type
-        assert isinstance(lhs_type, TensorType)
-        assert isinstance(rhs_type, TensorType)
-        assert isinstance(result_type, TensorType)
+        if not isinstance(lhs_type, TensorType):
+            raise VerifyException(f"array.dot: lhs must be a tensor, got {lhs_type}")
+        if not isinstance(rhs_type, TensorType):
+            raise VerifyException(f"array.dot: rhs must be a tensor, got {rhs_type}")
+        if not isinstance(result_type, TensorType):
+            raise VerifyException(f"array.dot: result must be a tensor, got {result_type}")
         if len(lhs_type.get_shape()) != 1:
             raise VerifyException(
                 f"array.dot: inputs must be rank-1, got lhs shape {lhs_type.get_shape()}"
@@ -301,6 +306,10 @@ class DotOp(IRDLOperation):
         if len(result_type.get_shape()) != 0:
             raise VerifyException(
                 f"array.dot: result must be rank-0, got shape {result_type.get_shape()}"
+            )
+        if not isinstance(result_type.element_type, Float32Type):
+            raise VerifyException(
+                f"array.dot: expected f32 result element type, got {result_type.element_type}"
             )
 
 

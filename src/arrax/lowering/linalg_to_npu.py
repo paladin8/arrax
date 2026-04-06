@@ -20,6 +20,8 @@ from xdsl.dialects.linalg import IteratorType
 from xdsl.ir import Block, Operation, SSAValue
 from xdsl.ir.affine import AffineMap
 from xdsl.passes import ModulePass
+
+from arrax.lowering.utils import find_preceding_fill
 from xdsl.pattern_rewriter import (
     GreedyRewritePatternApplier,
     PatternRewriter,
@@ -290,7 +292,7 @@ class LinalgReductionToNpuPattern(RewritePattern):
 
         # Find the fill that seeds our outs (must be in the same block,
         # directly before the generic after the alloca in the tiled case).
-        fill = _find_preceding_fill(op, out_val)
+        fill = find_preceding_fill(op, out_val)
         if fill is None:
             return
         acc_in = list(fill.inputs)[0]
@@ -388,18 +390,6 @@ class LinalgReductionToNpuPattern(RewritePattern):
         return None
 
 
-def _find_preceding_fill(
-    generic: linalg.GenericOp, out_val: SSAValue
-) -> linalg.FillOp | None:
-    """Walk backwards in the parent block for a linalg.fill writing out_val."""
-    cur = generic.prev_op
-    while cur is not None:
-        if isinstance(cur, linalg.FillOp):
-            for o in cur.outputs:
-                if o is out_val:
-                    return cur
-        cur = cur.prev_op
-    return None
 
 
 def _find_following_load(
