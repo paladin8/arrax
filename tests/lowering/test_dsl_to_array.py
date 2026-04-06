@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from arrax.dsl.array import Array, sum
+from arrax.dsl.array import Array, amax, sum
 from arrax.dsl.tracer import trace
 from arrax.lowering.dsl_to_array import dsl_to_array
 from tests.helpers import make_module
@@ -97,3 +97,22 @@ builtin.module {
         ir = str(module)
         assert "array.add" in ir
         assert "array.sum" in ir
+
+    def test_amax_rank0_result(self) -> None:
+        """amax(A) produces array.amax with a rank-0 tensor<f32> result."""
+        module = make_module(lambda A: amax(A), {"A": (128,)})
+        module.verify()
+        ir = str(module)
+        assert "array.amax" in ir
+        assert "tensor<128xf32> -> tensor<f32>" in ir
+        assert "func.func @kernel(%0: tensor<128xf32>) -> tensor<f32>" in ir
+
+    def test_amax_of_sub(self) -> None:
+        """amax(A - B) produces array.sub followed by array.amax."""
+        module = make_module(
+            lambda A, B: amax(A - B), {"A": (64,), "B": (64,)}
+        )
+        module.verify()
+        ir = str(module)
+        assert "array.sub" in ir
+        assert "array.amax" in ir

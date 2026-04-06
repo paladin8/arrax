@@ -31,6 +31,7 @@ from arrax.dialects.npu_dialect import (
     FVAddOp,
     FVDivOp,
     FVExpOp,
+    FVMaxOp,
     FVMulOp,
     FVReduceOp,
     FVReluOp,
@@ -214,7 +215,7 @@ class LinalgReductionToNpuPattern(RewritePattern):
 
     1. Untiled (N <= 64): the generic is in straight-line code with a
        preceding ``linalg.fill`` seeding its rank-0 output with the identity
-       constant. The cluster collapses to a single ``npu.fvreduce`` whose
+       constant. The cluster collapses to a single npu reduction op whose
        ``acc_in`` is the identity and whose result is stored to the output
        memref after the op via ``memref.store``.
 
@@ -223,12 +224,15 @@ class LinalgReductionToNpuPattern(RewritePattern):
        ``linalg.fill(acc)`` where ``acc`` is the loop's iter_arg. A
        subsequent ``memref.load`` reads the new accumulator and feeds
        ``scf.yield``. The ``alloca + fill + generic + load`` cluster
-       collapses to a single ``npu.fvreduce`` whose ``result`` replaces
+       collapses to a single npu reduction op whose ``result`` replaces
        the load and flows directly into ``scf.yield``.
 
-    Body shape currently handled: ``arith.addf(a, b), linalg.yield`` where
-    ``{a, b}`` is the pair of block arguments (order irrelevant). That is
-    the sum body; amax/dot/mean will be added in later phases.
+    Body-shape dispatch:
+      - ``arith.addf(a, b), linalg.yield`` -> ``npu.fvreduce``  (sum/mean)
+      - ``arith.maximumf(a, b), linalg.yield`` -> ``npu.fvmax``  (amax)
+
+    Operand order inside the combiner is irrelevant: ``{a, b}`` must be the
+    pair of block arguments.
     """
 
     @op_type_rewrite_pattern
@@ -267,23 +271,28 @@ class LinalgReductionToNpuPattern(RewritePattern):
         if not isinstance(src_type.element_type, Float32Type):
             return
 
-        # Body must be: addf(bb0, bb1), yield
+        # Body must be: <combiner>(bb0, bb1), yield, where combiner is
+        # one of the recognized single-input reduction shapes.
         body_block = op.body.blocks.first
         if body_block is None:
             return
         body_ops = list(body_block.ops)
         if len(body_ops) != 2:
             return
-        if not isinstance(body_ops[0], arith.AddfOp):
+        combiner = body_ops[0]
+        if isinstance(combiner, arith.AddfOp):
+            npu_op_cls: type = FVReduceOp
+        elif isinstance(combiner, arith.MaximumfOp):
+            npu_op_cls = FVMaxOp
+        else:
             return
         if not isinstance(body_ops[1], linalg.YieldOp):
             return
-        addf = body_ops[0]
         bargs = set(body_block.args)
-        if {addf.lhs, addf.rhs} != bargs:
+        if {combiner.lhs, combiner.rhs} != bargs:
             return
         yield_op = body_ops[1]
-        if list(yield_op.operands) != [addf.result]:
+        if list(yield_op.operands) != [combiner.result]:
             return
 
         # Find the fill that seeds our outs (must be in the same block,
@@ -299,29 +308,29 @@ class LinalgReductionToNpuPattern(RewritePattern):
             return
         extra_ops, n_ssa = extracted
 
-        # Build the npu.fvreduce op
-        fvreduce = FVReduceOp(src, n_ssa, acc_in)
+        # Build the npu reduction op (fvreduce for sum, fvmax for amax).
+        reduction_op = npu_op_cls(src, n_ssa, acc_in)
 
         load = _find_following_load(op, out_val)
         if load is not None:
-            # Tiled case: fvreduce.result takes the load's place.
+            # Tiled case: reduction_op.result takes the load's place.
             alloca_op: memref.AllocaOp | None = None
             if isinstance(out_val.owner, memref.AllocaOp):
                 alloca_op = out_val.owner
 
-            # 1. Replace generic with [extra_ops, fvreduce].
-            rewriter.replace_matched_op([*extra_ops, fvreduce], [])
+            # 1. Replace generic with [extra_ops, reduction_op].
+            rewriter.replace_matched_op([*extra_ops, reduction_op], [])
             # 2. Erase the fill (its role is subsumed by acc_in thread).
             rewriter.erase_op(fill)
-            # 3. Replace the load with fvreduce.result and erase it.
-            rewriter.replace_op(load, [], [fvreduce.result])
+            # 3. Replace the load with reduction_op.result and erase it.
+            rewriter.replace_op(load, [], [reduction_op.result])
             # 4. Erase the now-dead scratch alloca.
             if alloca_op is not None and not alloca_op.memref.uses:
                 rewriter.erase_op(alloca_op)
         else:
-            # Untiled case: emit a terminal store of the fvreduce result.
-            store = memref.StoreOp.get(fvreduce.result, out_val, [])
-            rewriter.replace_matched_op([*extra_ops, fvreduce, store], [])
+            # Untiled case: emit a terminal store of the result.
+            store = memref.StoreOp.get(reduction_op.result, out_val, [])
+            rewriter.replace_matched_op([*extra_ops, reduction_op, store], [])
             rewriter.erase_op(fill)
 
 

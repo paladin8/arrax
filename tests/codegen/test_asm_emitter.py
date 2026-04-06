@@ -21,7 +21,7 @@ from arrax.codegen.asm_emitter import (
     emit_assembly,
 )
 from arrax.dialects.npu_dialect import FVAddOp, FVSubOp
-from arrax.dsl.array import Array, exp, relu, sum
+from arrax.dsl.array import Array, amax, exp, relu, sum
 from arrax.lowering.array_to_linalg import ArrayToLinalgPass
 from arrax.lowering.bufferize import BufferizePass
 from arrax.lowering.linalg_to_npu import LinalgToNpuPass
@@ -445,6 +445,99 @@ kernel:
         asm = _to_asm_tiled(module)
         assert ".Lfor_" in asm
         assert ".insn r 0x2B, 0x0, 0x05" in asm
+
+    # --- amax reduction ---
+
+    def test_amax_untiled(self) -> None:
+        """amax(A), N=64: FVMAX .insn + fmax.s into fs0 + fsw terminal store.
+
+        FVMAX funct7 = 0x06; acc seed is -inf (IEEE 0xff800000 == -8388608
+        as a signed 32-bit integer — the li immediate encodes the bit
+        pattern, xDSL/GAS accept the signed form).
+        """
+        module = make_module(lambda A: amax(A), {"A": (64,)})
+        asm = _to_asm_tiled(module)
+        # FVMAX funct7 = 0x06
+        assert ".insn r 0x2B, 0x0, 0x06" in asm
+        # Accumulator materialized into scalar FP register fs0
+        assert "fs0" in asm
+        # Identity seeding: -inf loaded into fs0 via li+fmv.w.x
+        assert "fmv.w.x fs0" in asm
+        # Combine the per-call partial into fs0 via NaN-propagating max
+        assert "fmax.s fs0, fs0" in asm
+        # Terminal store to the rank-0 output memref (a1)
+        assert "fsw fs0, 0(a1)" in asm
+
+    def test_amax_small(self) -> None:
+        module = make_module(lambda A: amax(A), {"A": (16,)})
+        asm = _to_asm_tiled(module)
+        assert ".insn r 0x2B, 0x0, 0x06" in asm
+        assert "fmax.s fs0, fs0" in asm
+        assert "fsw fs0, 0(a1)" in asm
+
+    def test_amax_untiled_n_not_clobbered_by_acc_materialization(self) -> None:
+        """Regression: untiled fvmax must load n into t0 AFTER materializing
+        the f32 acc_in (-inf) — otherwise the ``li t0, <-inf bits>`` emitted
+        by materialization overwrites the just-loaded element count.
+        """
+        module = make_module(lambda A: amax(A), {"A": (16,)})
+        asm = _to_asm_tiled(module)
+        insn_idx = asm.index(".insn r 0x2B, 0x0, 0x06")
+        pre_insn = asm[:insn_idx]
+        last_li_t0 = pre_insn.rfind("li t0,")
+        assert last_li_t0 != -1
+        last_li_line = pre_insn[last_li_t0:].splitlines()[0]
+        assert "li t0, 16" in last_li_line, (
+            f"n clobbered before FVMAX; last li t0 before .insn was: "
+            f"{last_li_line!r}"
+        )
+
+    def test_amax_tiled_n_from_minsi_register(self) -> None:
+        """In the tiled case, FVMAX's n operand is the chunk size produced
+        by ``arith.minsi`` inside the loop body. It must live in a loop-body
+        t-register (t4/t5), not t0.
+        """
+        module = make_module(lambda A: amax(A), {"A": (128,)})
+        asm = _to_asm_tiled(module)
+        lines = asm.splitlines()
+        insn_lines = [line for line in lines if ".insn r 0x2B, 0x0, 0x06" in line]
+        assert len(insn_lines) == 1, f"expected one FVMAX, got {insn_lines}"
+        insn_line = insn_lines[0]
+        rs2 = insn_line.rsplit(",", 1)[1].strip()
+        assert rs2 in {"t4", "t5"}, (
+            f"tiled FVMAX n register should be a loop-body t-reg, got {rs2!r}"
+        )
+
+    def test_amax_tiled(self) -> None:
+        """amax(A), N=128: FVMAX inside scf.for; fs0 init (-inf) before loop;
+        fsw after."""
+        module = make_module(lambda A: amax(A), {"A": (128,)})
+        asm = _to_asm_tiled(module)
+        assert ".Lfor_" in asm
+        assert ".insn r 0x2B, 0x0, 0x06" in asm  # FVMAX
+        assert "fmax.s fs0, fs0" in asm
+        assert "fsw fs0, 0(a1)" in asm
+        # iter_args init (-inf) emitted before the loop label
+        pre_loop = asm.split(".Lfor_")[0]
+        assert "fmv.w.x fs0" in pre_loop
+        # Terminal store lives after the loop end label.
+        post_loop = asm.split(".Lfor_end")[-1]
+        assert "fsw fs0, 0(a1)" in post_loop
+
+    def test_amax_non_multiple(self) -> None:
+        """amax(A), N=100: remainder tolerated by FVMAX inside tiled loop."""
+        module = make_module(lambda A: amax(A), {"A": (100,)})
+        asm = _to_asm_tiled(module)
+        assert ".Lfor_" in asm
+        assert ".insn r 0x2B, 0x0, 0x06" in asm
+        assert "fsw fs0, 0(a1)" in asm
+
+    def test_amax_large(self) -> None:
+        """amax(A), N=1024."""
+        module = make_module(lambda A: amax(A), {"A": (1024,)})
+        asm = _to_asm_tiled(module)
+        assert ".Lfor_" in asm
+        assert ".insn r 0x2B, 0x0, 0x06" in asm
 
 
 class TestScalarFPRegisterPool:

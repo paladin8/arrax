@@ -15,7 +15,7 @@ from xdsl.dialects.linalg import IteratorTypeAttr
 from xdsl.ir import Block, Region
 from xdsl.ir.affine import AffineMap
 
-from arrax.dsl.array import Array, sum
+from arrax.dsl.array import Array, amax, sum
 from arrax.lowering.bufferize import BufferizePass
 from tests.helpers import bufferize, make_module
 
@@ -119,6 +119,20 @@ builtin.module {
         assert "memref<f32>" in ir
         # Reduction generic remains with outs = %1 (the rank-0 function arg).
         assert '"reduction"' in ir
+
+    def test_amax_rank0_output_is_function_arg(self) -> None:
+        """amax(A): same rank-0 promotion as sum, with -inf identity fill."""
+        module = make_module(lambda A: amax(A), {"A": (64,)})
+        bufferize(module)
+        ir = str(module)
+        assert "tensor<" not in ir
+        assert "func.func @kernel(%0: memref<64xf32>, %1: memref<f32>)" in ir
+        assert "linalg.fill" in ir
+        assert "memref<f32>" in ir
+        assert '"reduction"' in ir
+        # -inf identity seed survives bufferization unchanged.
+        assert "0xff800000" in ir.lower()
+        assert "arith.maximumf" in ir
 
     def test_sum_of_add_has_intermediate_alloc(self) -> None:
         """sum(A + B) needs a rank-1 alloc for the add and a rank-0 out arg."""

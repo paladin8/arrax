@@ -8,7 +8,7 @@ import numpy as np
 from riscv_npu import Emulator
 
 from arrax.codegen.build import build_elf
-from arrax.dsl.array import Array, exp, relu
+from arrax.dsl.array import Array, amax, exp, relu
 from arrax.dsl.array import sum as arr_sum
 from arrax.pipeline import compile_to_asm
 
@@ -533,6 +533,136 @@ class TestEndToEnd:
             tmp_path,
         )
         np.testing.assert_allclose(actual, expected, rtol=1e-4)
+
+    def test_amax_small(self, tmp_path: Path) -> None:
+        """amax(A) with N=16: untiled rank-0 max reduction."""
+        N = 16
+        A = np.array(
+            [-3.0, 1.0, 7.5, -0.5, 2.0, -10.0, 4.25, 0.0,
+             3.5, -1.5, 6.25, -7.0, 5.0, -2.0, 7.5, 1.25],
+            dtype=np.float32,
+        )
+        expected = float(A.max())
+
+        actual, _ = _compile_and_run_scalar(
+            lambda A: amax(A),
+            {"A": (N,)},
+            {"A": A},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-6)
+
+    def test_amax_exact_tile(self, tmp_path: Path) -> None:
+        """amax(A) with N=64: exact one-tile untiled reduction."""
+        N = 64
+        A = np.linspace(-2.0, 3.0, N, dtype=np.float32)
+        expected = float(A.max())
+
+        actual, _ = _compile_and_run_scalar(
+            lambda A: amax(A),
+            {"A": (N,)},
+            {"A": A},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-6)
+
+    def test_amax_non_multiple(self, tmp_path: Path) -> None:
+        """amax(A) with N=100: tiled reduction with remainder chunk."""
+        N = 100
+        rng = np.random.default_rng(42)
+        A = rng.standard_normal(N).astype(np.float32) * 5.0
+        expected = float(A.max())
+
+        actual, _ = _compile_and_run_scalar(
+            lambda A: amax(A),
+            {"A": (N,)},
+            {"A": A},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-6)
+
+    def test_amax_large(self, tmp_path: Path) -> None:
+        """amax(A) with N=1024: many tiled iterations threading -inf through fs0."""
+        N = 1024
+        A = np.arange(N, dtype=np.float32) - 500.0  # crosses zero, positive max
+        expected = float(A.max())
+
+        actual, _ = _compile_and_run_scalar(
+            lambda A: amax(A),
+            {"A": (N,)},
+            {"A": A},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-6)
+
+    def test_amax_all_negative(self, tmp_path: Path) -> None:
+        """amax over all-negative values: result is the least-negative element.
+
+        Exercises the -inf identity thread: if the seed ever got clobbered to
+        0.0 (like sum), the result would wrongly be 0.0 instead of the true
+        maximum.
+        """
+        N = 128
+        A = -np.arange(1, N + 1, dtype=np.float32)  # -1, -2, ..., -128
+        expected = float(A.max())  # -1.0
+        assert expected == -1.0
+
+        actual, _ = _compile_and_run_scalar(
+            lambda A: amax(A),
+            {"A": (N,)},
+            {"A": A},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-6)
+
+    def test_amax_nan_untiled(self, tmp_path: Path) -> None:
+        """amax propagates NaN like np.amax (untiled path).
+
+        The tile-level NPU.FVMAX already propagates NaN into ft0, but the
+        scalar ``fmax.s`` combine with the iter-arg accumulator suppresses
+        NaN from one operand per RISC-V spec. The emitter must add an
+        explicit NaN-check so a NaN in the input survives into the final
+        result.
+        """
+        N = 16
+        A = np.array(
+            [1.0, 2.0, 3.0, 4.0, 5.0, np.nan, 7.5, 0.0,
+             -1.0, -2.0, 6.0, -7.0, 0.5, 2.5, 3.5, 1.5],
+            dtype=np.float32,
+        )
+        expected = float(np.amax(A))
+        assert np.isnan(expected)
+
+        actual, _ = _compile_and_run_scalar(
+            lambda A: amax(A),
+            {"A": (N,)},
+            {"A": A},
+            tmp_path,
+        )
+        assert np.isnan(actual), f"expected NaN, got {actual!r}"
+
+    def test_amax_nan_tiled(self, tmp_path: Path) -> None:
+        """amax propagates NaN across tile boundaries.
+
+        Places a NaN in one tile and a large finite value (99.0) in a
+        *different* tile to catch the subtle bug where the NaN-carrying
+        tile is silently dropped and a later tile's max becomes the
+        result.
+        """
+        N = 128
+        A = np.ones(N, dtype=np.float32)
+        A[70] = np.nan  # NaN in chunk 1 (tile [64, 128))
+        A[100] = 99.0   # large finite in the same chunk
+        expected = float(np.amax(A))
+        assert np.isnan(expected)
+
+        actual, _ = _compile_and_run_scalar(
+            lambda A: amax(A),
+            {"A": (N,)},
+            {"A": A},
+            tmp_path,
+        )
+        assert np.isnan(actual), f"expected NaN, got {actual!r}"
 
     def test_reports_cycles(self, tmp_path: Path) -> None:
         """Emulator reports nonzero cycle count."""

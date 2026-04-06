@@ -419,8 +419,70 @@ class FVReduceOp(IRDLOperation):
                     )
 
 
+@irdl_op_definition
+class FVMaxOp(IRDLOperation):
+    """Chunk max reduction: result = max(acc_in, max(src[0..n])).
+
+    Maps to NPU.FVMAX (opcode=0x2B, funct7=0x06) followed by an
+    ``fmax.s`` combine with the prior accumulator.
+
+    The scalar accumulator is threaded through SSA (not a rank-0 memref)
+    so it stays in an FP register across loop iterations. NPU.FVMAX itself
+    propagates NaN from any input element into its result register, but
+    RISC-V ``fmax.s`` is NaN-suppressing when exactly one operand is NaN.
+    The asm emitter therefore follows the ``fmax.s`` combine with a
+    NaN-check that forces ``result := ft0`` whenever the FVMAX partial was
+    NaN, preserving ``arith.maximumf`` / ``np.amax`` semantics end-to-end.
+    """
+
+    name = "npu.fvmax"
+
+    src = operand_def(MemRefType)
+    n = operand_def(IndexType)
+    acc_in = operand_def(Float32Type)
+    result = result_def(Float32Type)
+
+    assembly_format = (
+        "$src `,` $n `,` $acc_in attr-dict"
+        " `:` type($src) `,` type($n) `,` type($acc_in) `->` type($result)"
+    )
+
+    def __init__(
+        self,
+        src: SSAValue | Operation,
+        n: SSAValue | Operation,
+        acc_in: SSAValue | Operation,
+    ) -> None:
+        super().__init__(
+            operands=[src, n, acc_in],
+            result_types=[Float32Type()],
+        )
+
+    def verify_(self) -> None:
+        src_type = self.src.type
+        assert isinstance(src_type, MemRefType)
+        if len(src_type.get_shape()) != 1:
+            raise VerifyException(
+                f"npu.fvmax: src must be a rank-1 memref, got shape "
+                f"{src_type.get_shape()}"
+            )
+        if not isinstance(src_type.element_type, Float32Type):
+            raise VerifyException(
+                f"npu.fvmax: expected f32 element type, got {src_type.element_type}"
+            )
+        if isinstance(self.n.owner, arith.ConstantOp):
+            n_attr = self.n.owner.value
+            if isinstance(n_attr, IntegerAttr):
+                n_val = n_attr.value.data
+                if n_val > NPU_MAX_VEC_LEN:
+                    raise VerifyException(
+                        f"npu.fvmax: n={n_val} exceeds NPU vector length "
+                        f"limit ({NPU_MAX_VEC_LEN})"
+                    )
+
+
 NPUDialect = Dialect(
     "npu",
-    [FVAddOp, FVSubOp, FVReluOp, FVExpOp, FVMulOp, FVDivOp, FVReduceOp],
+    [FVAddOp, FVSubOp, FVReluOp, FVExpOp, FVMulOp, FVDivOp, FVReduceOp, FVMaxOp],
     [],
 )

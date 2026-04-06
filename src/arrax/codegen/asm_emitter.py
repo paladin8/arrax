@@ -38,6 +38,7 @@ from arrax.dialects.npu_dialect import (
     FVAddOp,
     FVDivOp,
     FVExpOp,
+    FVMaxOp,
     FVMulOp,
     FVReduceOp,
     FVReluOp,
@@ -308,6 +309,8 @@ class _AsmEmitter:
             self._emit_fv_scalar_op(op, "FVDIV", 0x0B)
         elif isinstance(op, FVReduceOp):
             self._emit_fv_reduce(op)
+        elif isinstance(op, FVMaxOp):
+            self._emit_fv_max(op)
         elif isinstance(op, scf.ForOp):
             self._emit_for(op)
         elif isinstance(op, memref.SubviewOp):
@@ -539,6 +542,53 @@ class _AsmEmitter:
         )
         # Combine the per-call partial into the running accumulator.
         self._lines.append(f"    fadd.s {acc_reg}, {acc_reg}, ft0")
+
+    def _emit_fv_max(self, op: FVMaxOp) -> None:
+        """Emit NPU.FVMAX + fmax.s into the pooled accumulator register.
+
+        Mirrors :meth:`_emit_fv_reduce` exactly for the max reduction: the
+        ``acc_in`` SSA value already lives in an fs-register (iter_arg or
+        freshly-materialized -inf constant), ``result`` is bound to that
+        same register, and the per-chunk partial in ft0 is combined via
+        NaN-propagating ``fmax.s`` — matching NPU FVMAX semantics.
+        """
+        src = self._reg(op.src)
+
+        # Materialize acc_in into a pool register if needed. Do this BEFORE
+        # loading n into t0, since materialization uses t0 as scratch for
+        # the IEEE bits and would otherwise clobber the element count.
+        if self._fp_pool.contains(op.acc_in):
+            acc_reg = self._fp_pool.get(op.acc_in)
+        else:
+            acc_reg = self._fp_pool.allocate(op.acc_in)
+            self._materialize_f32_into(op.acc_in, acc_reg)
+        self._fp_pool.bind(op.result, acc_reg)
+
+        n_is_const = id(op.n) in self._const_map
+        if n_is_const:
+            self._lines.append(f"    li t0, {self._const(op.n)}")
+            n_reg = "t0"
+        else:
+            n_reg = self._reg(op.n)
+
+        self._lines.append(f"    # NPU.FVMAX ft0 = max({src}[0..{n_reg}])")
+        # FVMAX funct7 = 0x06; rd = ft0 (ephemeral), rs1 = src, rs2 = n.
+        self._lines.append(
+            f"    .insn r 0x2B, 0x0, 0x06, ft0, {src}, {n_reg}"
+        )
+        # Combine the per-call partial into the running accumulator.
+        # RISC-V fmax.s is NaN-suppressing (returns the non-NaN operand when
+        # exactly one is NaN), but np.amax / arith.maximumf are NaN-propagating.
+        # FVMAX already returns NaN in ft0 whenever any input element is NaN,
+        # so we force ``acc_reg := ft0`` when ft0 is NaN, otherwise take the
+        # normal fmax.s combine.
+        nan_skip_label = f".Lfvmax_nonan_{self._label_count}"
+        self._label_count += 1
+        self._lines.append(f"    fmax.s {acc_reg}, {acc_reg}, ft0")
+        self._lines.append(f"    feq.s t0, ft0, ft0")
+        self._lines.append(f"    bnez t0, {nan_skip_label}")
+        self._lines.append(f"    fmv.s {acc_reg}, ft0")
+        self._lines.append(f"{nan_skip_label}:")
 
     def _emit_store(self, op: memref.StoreOp) -> None:
         """Emit a rank-0 f32 store: ``fsw <val>, 0(<base>)``.

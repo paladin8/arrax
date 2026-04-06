@@ -5,7 +5,7 @@ from __future__ import annotations
 from xdsl.context import Context
 from xdsl.dialects.builtin import ModuleOp
 
-from arrax.dsl.array import Array, exp, relu, sum
+from arrax.dsl.array import Array, amax, exp, relu, sum
 
 from arrax.lowering.array_to_linalg import ArrayToLinalgPass
 from arrax.lowering.bufferize import BufferizePass
@@ -333,3 +333,63 @@ builtin.module {
         # not a new constant
         assert "arith.minsi" in ir
         assert "npu.fvadd" in ir
+
+    # --- reduction lowering (amax) ---
+
+    def test_amax_untiled_basic(self) -> None:
+        """amax(A), n=64: alloca+fill+maximumf-generic collapses to npu.fvmax + store."""
+        module = make_module(lambda A: amax(A), {"A": (64,)})
+        _lower_to_npu(module)
+        ir = str(module)
+        assert "npu.fvmax" in ir
+        assert "npu.fvreduce" not in ir  # must NOT be an fvreduce (it's a max, not sum)
+        assert "linalg.generic" not in ir
+        assert "linalg.fill" not in ir
+        assert "memref.store" in ir
+        assert "arith.constant 64 : index" in ir
+
+    def test_amax_untiled_small(self) -> None:
+        module = make_module(lambda A: amax(A), {"A": (16,)})
+        _lower_to_npu(module)
+        ir = str(module)
+        assert "npu.fvmax" in ir
+        assert "linalg.generic" not in ir
+
+    def test_amax_untiled_acc_is_neg_inf(self) -> None:
+        """Untiled amax threads acc_in = arith.constant -inf (0xff800000)."""
+        module = make_module(lambda A: amax(A), {"A": (32,)})
+        _lower_to_npu(module)
+        ir = str(module)
+        assert "0xff800000" in ir.lower()
+        assert "npu.fvmax" in ir
+
+    def test_amax_tiled_basic(self) -> None:
+        """amax(A), n=128: fvmax inside scf.for body, load/alloca erased."""
+        module = make_module(lambda A: amax(A), {"A": (128,)})
+        _lower_to_npu_with_tiling(module)
+        ir = str(module)
+        assert "npu.fvmax" in ir
+        assert "scf.for" in ir
+        assert "iter_args" in ir
+        assert "linalg.generic" not in ir
+        assert "linalg.fill" not in ir
+        assert "memref.alloca" not in ir
+        assert "memref.load" not in ir
+        assert "memref.store" in ir
+        assert "arith.minsi" in ir
+
+    def test_amax_tiled_non_multiple(self) -> None:
+        """amax(A), n=100: fvmax tolerates the remainder chunk."""
+        module = make_module(lambda A: amax(A), {"A": (100,)})
+        _lower_to_npu_with_tiling(module)
+        ir = str(module)
+        assert "npu.fvmax" in ir
+        assert "scf.for" in ir
+        assert "linalg.generic" not in ir
+
+    def test_amax_verifies(self) -> None:
+        """Verifier passes for both tiled and untiled amax."""
+        for n in (16, 64, 100, 128, 1024):
+            module = make_module(lambda A: amax(A), {"A": (n,)})
+            _lower_to_npu_with_tiling(module)
+            module.verify()

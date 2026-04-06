@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from arrax.dsl.array import Array, exp, relu, sum
+from arrax.dsl.array import Array, amax, exp, relu, sum
 
 
 class TestArray:
@@ -161,3 +161,23 @@ class TestArray:
         assert s.shape == ()
         inner = s.operands[0]
         assert inner.op == "add"
+
+    def test_amax_creates_dag_node(self) -> None:
+        """amax(A) builds a rank-0 DAG node."""
+        a = Array("A", (1024,))
+        m = amax(a)
+        assert m.op == "amax"
+        assert not m.is_leaf
+        assert m.shape == ()
+        assert len(m.operands) == 1
+        assert m.operands[0] is a
+
+    def test_amax_of_sub(self) -> None:
+        """amax(A - B) is a rank-0 reduction of an elementwise node."""
+        a = Array("A", (100,))
+        b = Array("B", (100,))
+        m = amax(a - b)
+        assert m.op == "amax"
+        assert m.shape == ()
+        inner = m.operands[0]
+        assert inner.op == "sub"

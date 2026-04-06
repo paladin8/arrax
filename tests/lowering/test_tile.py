@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from arrax.dsl.array import Array, sum
+from arrax.dsl.array import Array, amax, sum
 from tests.helpers import bufferize, make_module, tile
 
 
@@ -161,6 +161,44 @@ class TestTile:
         # (Inner alloca fill is memref<f32> too; check fill occurs only inside
         # the loop body by ensuring there's exactly one fill after tiling.)
         assert ir.count("linalg.fill") == 1
+
+    def test_amax_reduction_below_limit_unchanged(self) -> None:
+        """amax(A), n=32: untiled reduction passes through."""
+        expected = str(bufferize(make_module(lambda A: amax(A), {"A": (32,)})))
+
+        module = make_module(lambda A: amax(A), {"A": (32,)})
+        tile(module)
+        assert str(module) == expected
+
+    def test_amax_reduction_exact_multiple(self) -> None:
+        """amax(A), n=128: scf.for with f32 iter_args threading -inf identity."""
+        module = make_module(lambda A: amax(A), {"A": (128,)})
+        tile(module)
+        ir = str(module)
+        assert "scf.for" in ir
+        assert "iter_args" in ir
+        # -inf identity threaded through iter_args (xDSL prints f32 -inf
+        # as the hex literal 0xff800000).
+        assert "0xff800000" in ir.lower()
+        # Inner body still carries the maximumf combiner.
+        assert "arith.maximumf" in ir
+        assert '"reduction"' in ir
+
+    def test_amax_reduction_non_multiple(self) -> None:
+        """amax(A), n=100: remainder handled via arith.minsi inside the loop."""
+        module = make_module(lambda A: amax(A), {"A": (100,)})
+        tile(module)
+        ir = str(module)
+        assert "scf.for" in ir
+        assert "iter_args" in ir
+        assert "arith.minsi" in ir
+        assert "arith.maximumf" in ir
+
+    def test_amax_reduction_verifies(self) -> None:
+        """Tiled amax reduction IR passes xDSL verification."""
+        module = make_module(lambda A: amax(A), {"A": (100,)})
+        tile(module)
+        module.verify()
 
     def test_golden_128(self) -> None:
         """Golden-string snapshot for n=128."""

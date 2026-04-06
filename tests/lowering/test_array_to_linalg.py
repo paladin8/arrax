@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from arrax.dsl.array import Array, exp, relu, sum
+from arrax.dsl.array import Array, amax, exp, relu, sum
 from tests.helpers import lower_to_linalg, make_module
 
 
@@ -163,6 +163,34 @@ builtin.module {
         """sum(A + B) produces one parallel generic + one reduction generic."""
         module = make_module(
             lambda A, B: sum(A + B), {"A": (64,), "B": (64,)}
+        )
+        lower_to_linalg(module)
+        ir = str(module)
+        assert ir.count("linalg.generic") == 2
+        assert '"parallel"' in ir
+        assert '"reduction"' in ir
+
+    def test_amax_lowers_to_reduction_generic(self) -> None:
+        """amax(A) becomes tensor.empty + linalg.fill(-inf) + maximumf reduction."""
+        module = make_module(lambda A: amax(A), {"A": (128,)})
+        lower_to_linalg(module)
+        ir = str(module)
+        assert "array.amax" not in ir
+        assert "tensor.empty() : tensor<f32>" in ir
+        assert "linalg.fill" in ir
+        assert "linalg.generic" in ir
+        assert '"reduction"' in ir
+        # Body combiner is maximumf (NaN-propagating).
+        assert "arith.maximumf" in ir
+        # Sink map to rank-0.
+        assert "(d0) -> ()" in ir
+        # -inf identity seed: IEEE f32 -inf is 0xFF800000 (xDSL prints lowercase).
+        assert "0xff800000" in ir.lower()
+
+    def test_amax_of_sub_produces_two_generics(self) -> None:
+        """amax(A - B) produces one parallel generic + one reduction generic."""
+        module = make_module(
+            lambda A, B: amax(A - B), {"A": (64,), "B": (64,)}
         )
         lower_to_linalg(module)
         ir = str(module)

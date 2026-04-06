@@ -8,6 +8,7 @@ from xdsl.ir import SSAValue
 
 from arrax.dialects.array_dialect import (
     AddOp,
+    AmaxOp,
     DivScalarOp,
     ExpOp,
     MulScalarOp,
@@ -149,6 +150,11 @@ def dsl_to_array(
             sum_op = SumOp(operand)
             entry_block.add_op(sum_op)
             val = sum_op.result
+        elif node.op == "amax":
+            operand = lower(node.operands[0])
+            amax_op = AmaxOp(operand)
+            entry_block.add_op(amax_op)
+            val = amax_op.result
         else:
             raise ValueError(f"unsupported operation: {node.op}")
 

@@ -27,6 +27,7 @@ from xdsl.pattern_rewriter import (
 
 from arrax.dialects.array_dialect import (
     AddOp,
+    AmaxOp,
     DivScalarOp,
     ExpOp,
     MulScalarOp,
@@ -248,6 +249,9 @@ class DivScalarToLinalgPattern(RewritePattern):
         rewriter.replace_matched_op([empty, generic], [generic.res[0]])
 
 
+_F32_NEG_INF = float("-inf")
+
+
 class SumToLinalgPattern(RewritePattern):
     """Rewrite array.sum to linalg.fill + linalg.generic reduction.
 
@@ -304,6 +308,63 @@ class SumToLinalgPattern(RewritePattern):
         )
 
 
+class AmaxToLinalgPattern(RewritePattern):
+    """Rewrite array.amax to linalg.fill(-inf) + linalg.generic reduction.
+
+    The reduction generic takes the rank-1 input and a rank-0 output that
+    has been initialized to -inf via linalg.fill. Its body combines the
+    current accumulator with each input element via arith.maximumf
+    (NaN-propagating):
+
+        outs initialized via linalg.fill(-inf)
+        body: ^bb0(%in, %acc): %m = maximumf %acc, %in; yield %m
+    """
+
+    @op_type_rewrite_pattern
+    def match_and_rewrite(self, op: AmaxOp, rewriter: PatternRewriter) -> None:
+        input_type = op.input.type
+        assert isinstance(input_type, TensorType)
+        result_type = op.result.type
+        assert isinstance(result_type, TensorType)
+        f32 = Float32Type()
+
+        # Rank-0 destination tensor, seeded with -inf via linalg.fill
+        empty = tensor.EmptyOp([], result_type)
+        neg_inf = arith.ConstantOp(FloatAttr(_F32_NEG_INF, f32))
+        fill = linalg.FillOp(
+            inputs=[neg_inf.result],
+            outputs=[empty.tensor],
+            res=[result_type],
+        )
+
+        # Affine maps: input is (d0) -> (d0); output is (d0) -> () (scalar sink)
+        d0 = AffineMap.identity(1)
+        scalar_sink = AffineMap.from_callable(lambda d0: ())
+        maps = [AffineMapAttr(d0), AffineMapAttr(scalar_sink)]
+        iters = [IteratorTypeAttr.reduction()]
+
+        # Body: maximumf(acc, in), yield.
+        # Block args are (in, out_current_acc).
+        scalar_types = [f32, f32]
+        block = Block(arg_types=scalar_types)
+        maximum = arith.MaximumfOp(block.args[1], block.args[0])
+        yield_op = linalg.YieldOp(maximum.result)
+        block.add_ops([maximum, yield_op])
+        body = Region([block])
+
+        generic = linalg.GenericOp(
+            inputs=[op.input],
+            outputs=[fill.res[0]],
+            body=body,
+            indexing_maps=maps,
+            iterator_types=iters,
+            result_types=[result_type],
+        )
+        rewriter.replace_matched_op(
+            [empty, neg_inf, fill, generic], [generic.res[0]]
+        )
+
+
 @dataclass(frozen=True)
 class ArrayToLinalgPass(ModulePass):
     """Lower array dialect ops to linalg.generic on tensors."""
@@ -320,5 +381,6 @@ class ArrayToLinalgPass(ModulePass):
                 MulScalarToLinalgPattern(),
                 DivScalarToLinalgPattern(),
                 SumToLinalgPattern(),
+                AmaxToLinalgPattern(),
             ])
         ).rewrite_module(op)

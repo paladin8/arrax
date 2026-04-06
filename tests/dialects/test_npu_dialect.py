@@ -12,6 +12,7 @@ from xdsl.utils.test_value import create_ssa_value
 from arrax.dialects.npu_dialect import (
     FVAddOp,
     FVExpOp,
+    FVMaxOp,
     FVReduceOp,
     FVReluOp,
     FVSubOp,
@@ -415,6 +416,102 @@ builtin.module {
     %n = arith.constant 64 : index
     %acc = arith.constant 0.0 : f32
     %r = npu.fvreduce %src, %n, %acc : memref<64xf32>, index, f32 -> f32
+    func.return %r : f32
+  }
+}"""
+        ctx = Context()
+        ctx.load_dialect(Builtin)
+        ctx.load_dialect(NPUDialect)
+        ctx.load_dialect(Func)
+        ctx.load_dialect(Arith)
+        module = Parser(ctx, ir_text).parse_module()
+        module.verify()
+
+
+class TestFVMaxOp:
+    def test_construction(self) -> None:
+        memref_type = MemRefType(Float32Type(), [64])
+        src = create_ssa_value(memref_type)
+        n = create_ssa_value(IndexType())
+        acc_in = create_ssa_value(Float32Type())
+
+        op = FVMaxOp(src, n, acc_in)
+        assert op.src == src
+        assert op.n == n
+        assert op.acc_in == acc_in
+        assert op.result.type == Float32Type()
+
+    def test_verify(self) -> None:
+        memref_type = MemRefType(Float32Type(), [64])
+        src = create_ssa_value(memref_type)
+        n = create_ssa_value(IndexType())
+        acc_in = create_ssa_value(Float32Type())
+
+        op = FVMaxOp(src, n, acc_in)
+        op.verify()
+
+    def test_verify_wrong_element_type_fails(self) -> None:
+        f64_memref = MemRefType(Float64Type(), [64])
+        src = create_ssa_value(f64_memref)
+        n = create_ssa_value(IndexType())
+        acc_in = create_ssa_value(Float32Type())
+
+        op = FVMaxOp(src, n, acc_in)
+        with pytest.raises(VerifyException, match="expected f32 element type"):
+            op.verify()
+
+    def test_verify_rank0_src_fails(self) -> None:
+        src = create_ssa_value(MemRefType(Float32Type(), []))
+        n = create_ssa_value(IndexType())
+        acc_in = create_ssa_value(Float32Type())
+
+        op = FVMaxOp(src, n, acc_in)
+        with pytest.raises(VerifyException, match="rank-1"):
+            op.verify()
+
+    def test_verify_n_exceeds_limit_fails(self) -> None:
+        memref_type = MemRefType(Float32Type(), [128])
+        src = create_ssa_value(memref_type)
+        n_const = arith.ConstantOp(IntegerAttr(128, IndexType()))
+        acc_in = create_ssa_value(Float32Type())
+
+        op = FVMaxOp(src, n_const.result, acc_in)
+        with pytest.raises(VerifyException, match="exceeds NPU vector length limit"):
+            op.verify()
+
+    def test_verify_n_at_limit_ok(self) -> None:
+        memref_type = MemRefType(Float32Type(), [64])
+        src = create_ssa_value(memref_type)
+        n_const = arith.ConstantOp(IntegerAttr(64, IndexType()))
+        acc_in = create_ssa_value(Float32Type())
+
+        op = FVMaxOp(src, n_const.result, acc_in)
+        op.verify()
+
+    def test_ir_prints_correctly(self) -> None:
+        memref_type = MemRefType(Float32Type(), [64])
+        src = create_ssa_value(memref_type)
+        n = create_ssa_value(IndexType())
+        acc_in = create_ssa_value(Float32Type())
+
+        op = FVMaxOp(src, n, acc_in)
+        module = ModuleOp([src.owner, n.owner, acc_in.owner, op])
+        ir = str(module)
+        assert "npu.fvmax" in ir
+
+    def test_ir_round_trips(self) -> None:
+        from xdsl.context import Context
+        from xdsl.parser import Parser
+        from xdsl.dialects.builtin import Builtin
+        from xdsl.dialects.func import Func
+        from xdsl.dialects.arith import Arith
+
+        ir_text = """\
+builtin.module {
+  func.func @test(%src: memref<64xf32>) -> f32 {
+    %n = arith.constant 64 : index
+    %acc = arith.constant 0xff800000 : f32
+    %r = npu.fvmax %src, %n, %acc : memref<64xf32>, index, f32 -> f32
     func.return %r : f32
   }
 }"""

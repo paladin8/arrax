@@ -77,3 +77,16 @@ def sum(x: Array) -> Array:
     result.op = "sum"
     result.operands = [x]
     return result
+
+
+def amax(x: Array) -> Array:
+    """Max-reduction across all elements. Returns a rank-0 Array.
+
+    Named after NumPy's ``amax`` to avoid shadowing Python's ``max`` builtin.
+    Reductions must be the compiled function's return value (terminal); a
+    non-terminal use raises at compile time.
+    """
+    result = Array(name="", shape=())
+    result.op = "amax"
+    result.operands = [x]
+    return result
