@@ -202,10 +202,14 @@ class LinalgElementwiseToNpuPattern(RewritePattern):
             npu_op = FVExpOp(inputs[0], outputs[0], n_ssa)
         elif npu_op_type == "mul_scalar":
             assert scalar_val is not None
-            npu_op = FVMulOp(inputs[0], outputs[0], n_ssa, scalar_val)
+            scalar_const = arith.ConstantOp(FloatAttr(scalar_val, Float32Type()))
+            npu_op = FVMulOp(inputs[0], outputs[0], n_ssa, scalar_const.result)
+            extra_ops.append(scalar_const)
         elif npu_op_type == "div_scalar":
             assert scalar_val is not None
-            npu_op = FVDivOp(inputs[0], outputs[0], n_ssa, scalar_val)
+            scalar_const = arith.ConstantOp(FloatAttr(scalar_val, Float32Type()))
+            npu_op = FVDivOp(inputs[0], outputs[0], n_ssa, scalar_const.result)
+            extra_ops.append(scalar_const)
         else:
             return
 

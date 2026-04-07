@@ -11,12 +11,16 @@ from xdsl.utils.test_value import create_ssa_value
 
 from arrax.dialects.npu_dialect import (
     FVAddOp,
+    FVDivOp,
     FVExpOp,
     FVMacOp,
     FVMaxOp,
+    FVMulOp,
     FVReduceOp,
     FVReluOp,
+    FRsqrtOp,
     FVSubOp,
+    FVSubScalarOp,
     NPUDialect,
 )
 
@@ -672,3 +676,180 @@ builtin.module {
         ctx.load_dialect(Arith)
         module = Parser(ctx, ir_text).parse_module()
         module.verify()
+
+
+class TestFVMulOp:
+    """Tests for the refactored FVMulOp (SSA scalar operand)."""
+
+    def test_construction_with_ssa_scalar(self) -> None:
+        memref_type = MemRefType(Float32Type(), [64])
+        src = create_ssa_value(memref_type)
+        dst = create_ssa_value(memref_type)
+        n = create_ssa_value(IndexType())
+        scalar = create_ssa_value(Float32Type())
+
+        op = FVMulOp(src, dst, n, scalar)
+        assert op.src == src
+        assert op.dst == dst
+        assert op.n == n
+        assert op.scalar == scalar
+
+    def test_verify(self) -> None:
+        memref_type = MemRefType(Float32Type(), [64])
+        src = create_ssa_value(memref_type)
+        dst = create_ssa_value(memref_type)
+        n = create_ssa_value(IndexType())
+        scalar = create_ssa_value(Float32Type())
+
+        op = FVMulOp(src, dst, n, scalar)
+        op.verify()
+
+    def test_verify_mismatched_types_fails(self) -> None:
+        type_a = MemRefType(Float32Type(), [64])
+        type_b = MemRefType(Float32Type(), [32])
+        src = create_ssa_value(type_a)
+        dst = create_ssa_value(type_b)
+        n = create_ssa_value(IndexType())
+        scalar = create_ssa_value(Float32Type())
+
+        op = FVMulOp(src, dst, n, scalar)
+        with pytest.raises(VerifyException, match="src and dst must have the same type"):
+            op.verify()
+
+    def test_verify_n_exceeds_limit_fails(self) -> None:
+        memref_type = MemRefType(Float32Type(), [128])
+        src = create_ssa_value(memref_type)
+        dst = create_ssa_value(memref_type)
+        n_const = arith.ConstantOp(IntegerAttr(128, IndexType()))
+        scalar = create_ssa_value(Float32Type())
+
+        op = FVMulOp(src, dst, n_const.result, scalar)
+        with pytest.raises(VerifyException, match="exceeds NPU vector length limit"):
+            op.verify()
+
+
+class TestFVDivOp:
+    """Tests for the refactored FVDivOp (SSA scalar operand)."""
+
+    def test_construction_with_ssa_scalar(self) -> None:
+        memref_type = MemRefType(Float32Type(), [64])
+        src = create_ssa_value(memref_type)
+        dst = create_ssa_value(memref_type)
+        n = create_ssa_value(IndexType())
+        scalar = create_ssa_value(Float32Type())
+
+        op = FVDivOp(src, dst, n, scalar)
+        assert op.scalar == scalar
+
+    def test_verify(self) -> None:
+        memref_type = MemRefType(Float32Type(), [64])
+        src = create_ssa_value(memref_type)
+        dst = create_ssa_value(memref_type)
+        n = create_ssa_value(IndexType())
+        scalar = create_ssa_value(Float32Type())
+
+        op = FVDivOp(src, dst, n, scalar)
+        op.verify()
+
+
+class TestFVSubScalarOp:
+    def test_construction(self) -> None:
+        memref_type = MemRefType(Float32Type(), [64])
+        src = create_ssa_value(memref_type)
+        dst = create_ssa_value(memref_type)
+        n = create_ssa_value(IndexType())
+        scalar = create_ssa_value(Float32Type())
+
+        op = FVSubScalarOp(src, dst, n, scalar)
+        assert op.src == src
+        assert op.dst == dst
+        assert op.n == n
+        assert op.scalar == scalar
+
+    def test_verify(self) -> None:
+        memref_type = MemRefType(Float32Type(), [64])
+        src = create_ssa_value(memref_type)
+        dst = create_ssa_value(memref_type)
+        n = create_ssa_value(IndexType())
+        scalar = create_ssa_value(Float32Type())
+
+        op = FVSubScalarOp(src, dst, n, scalar)
+        op.verify()
+
+    def test_verify_mismatched_types_fails(self) -> None:
+        type_a = MemRefType(Float32Type(), [64])
+        type_b = MemRefType(Float32Type(), [32])
+        src = create_ssa_value(type_a)
+        dst = create_ssa_value(type_b)
+        n = create_ssa_value(IndexType())
+        scalar = create_ssa_value(Float32Type())
+
+        op = FVSubScalarOp(src, dst, n, scalar)
+        with pytest.raises(VerifyException, match="src and dst must have the same type"):
+            op.verify()
+
+    def test_verify_n_exceeds_limit_fails(self) -> None:
+        memref_type = MemRefType(Float32Type(), [128])
+        src = create_ssa_value(memref_type)
+        dst = create_ssa_value(memref_type)
+        n_const = arith.ConstantOp(IntegerAttr(128, IndexType()))
+        scalar = create_ssa_value(Float32Type())
+
+        op = FVSubScalarOp(src, dst, n_const.result, scalar)
+        with pytest.raises(VerifyException, match="exceeds NPU vector length limit"):
+            op.verify()
+
+    def test_dialect_contains_op(self) -> None:
+        assert FVSubScalarOp in NPUDialect._operations
+
+    def test_ir_prints_correctly(self) -> None:
+        memref_type = MemRefType(Float32Type(), [64])
+        src = create_ssa_value(memref_type)
+        dst = create_ssa_value(memref_type)
+        n = create_ssa_value(IndexType())
+        scalar = create_ssa_value(Float32Type())
+
+        op = FVSubScalarOp(src, dst, n, scalar)
+        module = ModuleOp([src.owner, dst.owner, n.owner, scalar.owner, op])
+        ir = str(module)
+        assert "npu.fvsub_scalar" in ir
+
+
+class TestFRsqrtOp:
+    def test_construction(self) -> None:
+        src = create_ssa_value(MemRefType(Float32Type(), []))
+
+        op = FRsqrtOp(src)
+        assert op.src == src
+        assert op.result.type == Float32Type()
+
+    def test_verify(self) -> None:
+        src = create_ssa_value(MemRefType(Float32Type(), []))
+
+        op = FRsqrtOp(src)
+        op.verify()
+
+    def test_verify_non_rank0_fails(self) -> None:
+        src = create_ssa_value(MemRefType(Float32Type(), [64]))
+
+        op = FRsqrtOp(src)
+        with pytest.raises(VerifyException, match="rank-0"):
+            op.verify()
+
+    def test_verify_wrong_element_type_fails(self) -> None:
+        src = create_ssa_value(MemRefType(Float64Type(), []))
+
+        op = FRsqrtOp(src)
+        with pytest.raises(VerifyException, match="f32 element type"):
+            op.verify()
+
+    def test_dialect_contains_op(self) -> None:
+        assert FRsqrtOp in NPUDialect._operations
+
+    def test_ir_prints_correctly(self) -> None:
+        src = create_ssa_value(MemRefType(Float32Type(), []))
+
+        op = FRsqrtOp(src)
+        module = ModuleOp([src.owner, op])
+        ir = str(module)
+        assert "npu.frsqrt" in ir

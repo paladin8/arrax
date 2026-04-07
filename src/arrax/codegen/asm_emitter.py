@@ -43,7 +43,9 @@ from arrax.dialects.npu_dialect import (
     FVMulOp,
     FVReduceOp,
     FVReluOp,
+    FRsqrtOp,
     FVSubOp,
+    FVSubScalarOp,
 )
 
 # t-registers for loop-body-local values that die before the copy loop.
@@ -308,6 +310,10 @@ class _AsmEmitter:
             self._emit_fv_scalar_op(op, "FVMUL", 0x04)
         elif isinstance(op, FVDivOp):
             self._emit_fv_scalar_op(op, "FVDIV", 0x0B)
+        elif isinstance(op, FVSubScalarOp):
+            self._emit_fv_scalar_op(op, "FVSUB_SCALAR", 0x0C)
+        elif isinstance(op, FRsqrtOp):
+            self._emit_frsqrt(op)
         elif isinstance(op, FVReduceOp):
             self._emit_fv_reduce(op)
         elif isinstance(op, FVMaxOp):
@@ -324,6 +330,10 @@ class _AsmEmitter:
             self._emit_subi(op)
         elif isinstance(op, arith.MinSIOp):
             self._emit_minsi(op)
+        elif isinstance(op, arith.DivfOp):
+            self._emit_scalar_fp_binop(op, "fdiv.s")
+        elif isinstance(op, arith.AddfOp):
+            self._emit_scalar_fp_binop(op, "fadd.s")
         elif isinstance(op, scf.YieldOp):
             self._emit_yield(op)
         elif isinstance(op, Operation):
@@ -697,13 +707,12 @@ class _AsmEmitter:
     def _emit_store(self, op: memref.StoreOp) -> None:
         """Emit a rank-0 f32 store: ``fsw <val>, 0(<base>)``.
 
-        Only rank-0 stores are supported in M3 (the terminal write of a
-        reduction result). Other memref.store shapes are not produced by
-        the pipeline.
+        Only rank-0 stores are currently supported (the terminal write of a
+        reduction result, or scratch stores for FRSQRT).
         """
         if op.indices:
             raise ValueError(
-                "asm_emitter: only rank-0 memref.store is supported in M3"
+                "asm_emitter: only rank-0 memref.store is supported"
             )
         val = op.value
         ref = op.memref
@@ -778,50 +787,48 @@ class _AsmEmitter:
                 f"    .insn r 0x2B, 0x0, {funct7_hex}, {n_reg}, {src}, {dst}"
             )
 
-    def _emit_facc_load(self, scalar_bits: int) -> None:
-        """Emit the instruction sequence to load a float32 scalar into facc.
+    def _emit_facc_load_from_pool(self, scalar: SSAValue) -> None:
+        """Load a scalar f32 SSA value from the register pool into facc.
 
-        Sequence: FRSTACC (zero facc), load scalar bits into f1,
-        load 1.0 into f2, FMACC (facc = f1 * f2 = scalar).
+        The value must already be in the pool (allocated by _emit_constant
+        or by a reduction emitter). Sequence: FRSTACC, load 1.0 into ft0,
+        FMACC pool_reg * 1.0.
         """
-        self._lines.append(f"    # Load scalar into facc")
-        # FRSTACC: f[rd] = facc; facc = 0.0
+        # Ensure the scalar is in the pool
+        if not self._fp_pool.contains(scalar):
+            fp_reg = self._fp_pool.allocate(scalar)
+            self._materialize_f32_into(scalar, fp_reg)
+        scalar_reg = self._fp_pool.get(scalar)
+
+        self._lines.append(f"    # Load {scalar_reg} into facc")
+        # FRSTACC: zero facc
         self._lines.append(f"    .insn r 0x2B, 0x5, 0x00, f0, f0, f0")
-        # Load scalar float bits into f1
-        self._lines.append(f"    li t0, {scalar_bits}")
-        self._lines.append(f"    fmv.w.x f1, t0")
-        # Load 1.0f into f2
+        # Load 1.0f into ft0
         self._lines.append(f"    lui t0, 0x3F800")
-        self._lines.append(f"    fmv.w.x f2, t0")
-        # FMACC: facc += f1 * f2 = scalar * 1.0
-        self._lines.append(f"    .insn r 0x2B, 0x0, 0x00, f0, f1, f2")
+        self._lines.append(f"    fmv.w.x ft0, t0")
+        # FMACC: facc += scalar * 1.0
+        self._lines.append(
+            f"    .insn r 0x2B, 0x0, 0x00, f0, {scalar_reg}, ft0"
+        )
 
     def _emit_fv_scalar_op(
-        self, op: FVMulOp | FVDivOp, name: str, funct7: int
+        self, op: FVMulOp | FVDivOp | FVSubScalarOp, name: str, funct7: int
     ) -> None:
         """Emit facc load + .insn for a scalar-vector NPU op.
 
-        NOTE: facc load is emitted inline with each scalar op. In a tiled
-        loop, this reloads facc each iteration. A future optimization could
-        hoist the load before the loop since facc persists across iterations.
+        The scalar is an SSA f32 operand (compile-time constant or runtime
+        reduction result). It is loaded from the register pool into facc.
         """
         src = self._reg(op.src)
         dst = self._reg(op.dst)
         n_is_const = id(op.n) in self._const_map
         funct7_hex = f"0x{funct7:02X}"
-        op_symbol = "*" if isinstance(op, FVMulOp) else "/"
 
-        # Convert float scalar to IEEE 754 bits
-        scalar_val = op.scalar.value.data
-        scalar_bits = struct.unpack("<I", struct.pack("<f", scalar_val))[0]
-
-        # Load scalar into facc
-        self._emit_facc_load(scalar_bits)
+        # Load scalar into facc from pool
+        self._emit_facc_load_from_pool(op.scalar)
 
         # NPU instruction: rd=n, rs1=src, rs2=dst
-        self._lines.append(
-            f"    # NPU.{name} {dst}[i] = {src}[i] {op_symbol} {scalar_val}"
-        )
+        self._lines.append(f"    # NPU.{name} {src} -> {dst}")
         if n_is_const:
             self._lines.append(f"    li t0, {self._const(op.n)}")
             self._lines.append(
@@ -832,6 +839,44 @@ class _AsmEmitter:
             self._lines.append(
                 f"    .insn r 0x2B, 0x0, {funct7_hex}, {n_reg}, {src}, {dst}"
             )
+
+    def _emit_scalar_fp_binop(
+        self, op: arith.DivfOp | arith.AddfOp, mnemonic: str
+    ) -> None:
+        """Emit a scalar RISC-V F instruction (fdiv.s, fadd.s).
+
+        Both operands and the result are f32 SSA values managed by the pool.
+        """
+        lhs = op.lhs
+        rhs = op.rhs
+        # Ensure operands are in the pool
+        if not self._fp_pool.contains(lhs):
+            lhs_reg = self._fp_pool.allocate(lhs)
+            self._materialize_f32_into(lhs, lhs_reg)
+        else:
+            lhs_reg = self._fp_pool.get(lhs)
+        if not self._fp_pool.contains(rhs):
+            rhs_reg = self._fp_pool.allocate(rhs)
+            self._materialize_f32_into(rhs, rhs_reg)
+        else:
+            rhs_reg = self._fp_pool.get(rhs)
+        result_reg = self._fp_pool.allocate(op.result)
+        self._lines.append(
+            f"    {mnemonic} {result_reg}, {lhs_reg}, {rhs_reg}"
+        )
+
+    def _emit_frsqrt(self, op: FRsqrtOp) -> None:
+        """Emit FRSQRT: f[rd] = 1/sqrt(mem[rs1]).
+
+        Reads one f32 from the rank-0 memref src, returns 1/sqrt to a float
+        register managed by the pool.
+        """
+        src_reg = self._reg(op.src)
+        result_reg = self._fp_pool.allocate(op.result)
+        self._lines.append(f"    # NPU.FRSQRT {result_reg} = 1/sqrt(mem[{src_reg}])")
+        self._lines.append(
+            f"    .insn r 0x2B, 0x0, 0x03, {result_reg}, {src_reg}, x0"
+        )
 
     def _emit_fv_binop(
         self, op: FVAddOp | FVSubOp, name: str, funct7: int

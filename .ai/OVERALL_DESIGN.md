@@ -222,7 +222,7 @@ npu.fvmax        %src, %n             : (memref, index) -> f32_reg
 // Scalar
 npu.frelu        %src                 : (f32_reg) -> f32_reg
 npu.fgelu        %src                 : (f32_reg) -> f32_reg
-npu.fvrsqrt      %addr                : (memref) -> f32_reg
+npu.frsqrt      %addr                : (memref) -> f32_reg
 ```
 
 Operations use memref operands for arrays and f32 register operands for scalars. The NPU's `fvmul_scale`, `fvdiv_scale`, and `fvsub_scalar` operations implicitly read the scalar from the FP accumulator.
@@ -274,7 +274,7 @@ npu.fvdiv_scale %exp_buf, %dst, %n
 npu.fvmac %x, %x, %n                      // facc = sum(x²)
 npu.frstacc → %sum_sq
 // scalar: mean_sq = sum_sq / N + eps (FDIV.S, FADD.S)
-npu.fvrsqrt %mean_sq_addr → %scale
+npu.frsqrt %mean_sq_addr → %scale
 // store scale to facc via FMACC
 npu.fvmul_scale %x, %tmp, %n              // tmp = x * scale
 // gamma multiplication: element-by-element (scalar loop or staged FVMUL)

@@ -236,7 +236,9 @@ class FVMulOp(IRDLOperation):
     """Vector multiply by scalar: dst[i] = src[i] * scalar.
 
     Maps to NPU.FVMUL (opcode=0x2B, funct7=0x04).
-    The scalar is loaded into facc before execution.
+    The scalar is loaded into facc before execution. It is passed as an
+    SSA f32 operand — either from an arith.constant (compile-time) or
+    from a reduction result (runtime).
     """
 
     name = "npu.fvmul"
@@ -244,12 +246,10 @@ class FVMulOp(IRDLOperation):
     src = operand_def(MemRefType)
     dst = operand_def(MemRefType)
     n = operand_def(IndexType)
-    scalar = prop_def(FloatAttr)
-
-    irdl_options = (ParsePropInAttrDict(),)
+    scalar = operand_def(Float32Type)
 
     assembly_format = (
-        "$src `,` $dst `,` $n attr-dict"
+        "$src `,` $dst `,` $n `,` $scalar attr-dict"
         " `:` type($src) `,` type($dst) `,` type($n)"
     )
 
@@ -258,12 +258,11 @@ class FVMulOp(IRDLOperation):
         src: SSAValue | Operation,
         dst: SSAValue | Operation,
         n: SSAValue | Operation,
-        scalar: float,
+        scalar: SSAValue | Operation,
     ) -> None:
         super().__init__(
-            operands=[src, dst, n],
+            operands=[src, dst, n, scalar],
             result_types=[],
-            properties={"scalar": FloatAttr(scalar, Float32Type())},
         )
 
     def verify_(self) -> None:
@@ -295,7 +294,9 @@ class FVDivOp(IRDLOperation):
     """Vector divide by scalar: dst[i] = src[i] / scalar.
 
     Maps to NPU.FVDIV (opcode=0x2B, funct7=0x0B).
-    The scalar is loaded into facc before execution.
+    The scalar is loaded into facc before execution. It is passed as an
+    SSA f32 operand — either from an arith.constant (compile-time) or
+    from a reduction result (runtime).
     """
 
     name = "npu.fvdiv"
@@ -303,12 +304,10 @@ class FVDivOp(IRDLOperation):
     src = operand_def(MemRefType)
     dst = operand_def(MemRefType)
     n = operand_def(IndexType)
-    scalar = prop_def(FloatAttr)
-
-    irdl_options = (ParsePropInAttrDict(),)
+    scalar = operand_def(Float32Type)
 
     assembly_format = (
-        "$src `,` $dst `,` $n attr-dict"
+        "$src `,` $dst `,` $n `,` $scalar attr-dict"
         " `:` type($src) `,` type($dst) `,` type($n)"
     )
 
@@ -317,12 +316,11 @@ class FVDivOp(IRDLOperation):
         src: SSAValue | Operation,
         dst: SSAValue | Operation,
         n: SSAValue | Operation,
-        scalar: float,
+        scalar: SSAValue | Operation,
     ) -> None:
         super().__init__(
-            operands=[src, dst, n],
+            operands=[src, dst, n, scalar],
             result_types=[],
-            properties={"scalar": FloatAttr(scalar, Float32Type())},
         )
 
     def verify_(self) -> None:
@@ -347,6 +345,98 @@ class FVDivOp(IRDLOperation):
                         f"npu.fvdiv: n={n_val} exceeds NPU vector length "
                         f"limit ({NPU_MAX_VEC_LEN})"
                     )
+
+
+@irdl_op_definition
+class FVSubScalarOp(IRDLOperation):
+    """Vector subtract by scalar: dst[i] = src[i] - scalar.
+
+    Maps to NPU.FVSUB_SCALAR (opcode=0x2B, funct7=0x0C).
+    The scalar is loaded into facc before execution. It is passed as an
+    SSA f32 operand (typically a reduction result).
+    """
+
+    name = "npu.fvsub_scalar"
+
+    src = operand_def(MemRefType)
+    dst = operand_def(MemRefType)
+    n = operand_def(IndexType)
+    scalar = operand_def(Float32Type)
+
+    assembly_format = (
+        "$src `,` $dst `,` $n `,` $scalar attr-dict"
+        " `:` type($src) `,` type($dst) `,` type($n)"
+    )
+
+    def __init__(
+        self,
+        src: SSAValue | Operation,
+        dst: SSAValue | Operation,
+        n: SSAValue | Operation,
+        scalar: SSAValue | Operation,
+    ) -> None:
+        super().__init__(operands=[src, dst, n, scalar], result_types=[])
+
+    def verify_(self) -> None:
+        src_type = self.src.type
+        dst_type = self.dst.type
+        if src_type != dst_type:
+            raise VerifyException(
+                f"npu.fvsub_scalar: src and dst must have the same type, "
+                f"got {src_type} and {dst_type}"
+            )
+        assert isinstance(src_type, MemRefType)
+        if not isinstance(src_type.element_type, Float32Type):
+            raise VerifyException(
+                f"npu.fvsub_scalar: expected f32 element type, "
+                f"got {src_type.element_type}"
+            )
+        if isinstance(self.n.owner, arith.ConstantOp):
+            n_attr = self.n.owner.value
+            if isinstance(n_attr, IntegerAttr):
+                n_val = n_attr.value.data
+                if n_val > NPU_MAX_VEC_LEN:
+                    raise VerifyException(
+                        f"npu.fvsub_scalar: n={n_val} exceeds NPU vector "
+                        f"length limit ({NPU_MAX_VEC_LEN})"
+                    )
+
+
+@irdl_op_definition
+class FRsqrtOp(IRDLOperation):
+    """Reciprocal square root: result = 1/sqrt(mem[src]).
+
+    Maps to NPU.FRSQRT (opcode=0x2B, funct7=0x03).
+    Reads one f32 from memory at src address, returns 1/sqrt(value) as
+    scalar f32. This is a scalar instruction (no element count).
+    """
+
+    name = "npu.frsqrt"
+
+    src = operand_def(MemRefType)
+    result = result_def(Float32Type)
+
+    assembly_format = "$src attr-dict `:` type($src)"
+
+    def __init__(self, src: SSAValue | Operation) -> None:
+        super().__init__(
+            operands=[src],
+            result_types=[Float32Type()],
+        )
+
+    def verify_(self) -> None:
+        src_type = self.src.type
+        assert isinstance(src_type, MemRefType)
+        if len(src_type.get_shape()) != 0:
+            raise VerifyException(
+                f"npu.frsqrt: expected rank-0 memref, "
+                f"got {src_type}"
+            )
+        if not isinstance(src_type.element_type, Float32Type):
+            raise VerifyException(
+                f"npu.frsqrt: expected f32 element type, "
+                f"got {src_type.element_type}"
+            )
 
 
 @irdl_op_definition
@@ -561,6 +651,9 @@ class FVMacOp(IRDLOperation):
 
 NPUDialect = Dialect(
     "npu",
-    [FVAddOp, FVSubOp, FVReluOp, FVExpOp, FVMulOp, FVDivOp, FVReduceOp, FVMaxOp, FVMacOp],
+    [
+        FVAddOp, FVSubOp, FVReluOp, FVExpOp, FVMulOp, FVDivOp,
+        FVSubScalarOp, FRsqrtOp, FVReduceOp, FVMaxOp, FVMacOp,
+    ],
     [],
 )

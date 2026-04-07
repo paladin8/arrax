@@ -9,7 +9,7 @@ Lift the terminal-only restriction on reductions, enabling scalar reduction resu
 | DSL surface    | Array dialect op | Decomposition in ArrayToLinalg                                      | New NPU ops used     |
 |----------------|------------------|----------------------------------------------------------------------|----------------------|
 | `softmax(A)`   | SoftmaxOp        | amax -> sub_broadcast -> exp -> sum -> div_broadcast                 | FVSubScalarOp        |
-| `rmsnorm(A)`   | RMSNormOp        | dot(x,x) -> scalar div/add/rsqrt -> mul_broadcast                   | FVRsqrtOp            |
+| `rmsnorm(A)`   | RMSNormOp        | dot(x,x) -> scalar div/add/rsqrt -> mul_broadcast                   | FRsqrtOp            |
 
 Both ops take rank-1 `tensor<Nxf32>` input and produce rank-1 `tensor<Nxf32>` output. They are composite: ArrayToLinalg decomposes them into sequences of linalg.generic ops (reductions + elementwise with scalar broadcast). No new array-level rewrite is needed in downstream passes.
 
@@ -26,7 +26,7 @@ trace
   -> LinalgToNpu                         [EXTENDED: broadcast patterns, new NPU ops, scalar forwarding, rmsnorm scalar math]
   -> NpuCanonicalize                     [UNCHANGED]
   -> verify
-  -> emit_assembly                       [EXTENDED: FVSubScalarOp, FVRsqrtOp, scalar arith, runtime scalar facc load]
+  -> emit_assembly                       [EXTENDED: FVSubScalarOp, FRsqrtOp, scalar arith, runtime scalar facc load]
 ```
 
 Four passes extended, one changed, rest unchanged.
@@ -136,7 +136,7 @@ linalg.fill(%zero, %sumsq_init)
 // Steps 2-4: multiply by scale (broadcast)
 // The scalar math (sumsq/N + eps, rsqrt) is encoded as attributes on the broadcast-mul
 // generic. LinalgToNpu reads these attributes and emits the scalar math sequence
-// (fdiv.s, fadd.s, store-to-scratch, FVRSQRT) between loading the reduction result
+// (fdiv.s, fadd.s, store-to-scratch, FRSQRT) between loading the reduction result
 // and executing the FVMUL.
 %out = linalg.generic {
     indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> ()>, affine_map<(d0) -> (d0)>],
@@ -170,7 +170,7 @@ Still three passes. The add gets fused into the amax reduction.
 **RMSNorm (N > 64):**
 After tiling, dot + mul become 2 scf.for loops. Scalar math is not tiled. After fusion:
 - Loop 1: dot(x,x) reduction
-- Scalar: fdiv.s, fadd.s, fvrsqrt (not looped, emitted by LinalgToNpu)
+- Scalar: fdiv.s, fadd.s, frsqrt (not looped, emitted by LinalgToNpu)
 - Loop 2: mul by scale (elementwise)
 
 Two passes over data.
@@ -282,14 +282,14 @@ class FVSubScalarOp(IRDLOperation):
 
 Semantics: `dst[i] = src[i] - scalar` for i in 0..n-1. The scalar is loaded into facc before the instruction executes.
 
-### FVRsqrtOp
+### FRsqrtOp
 
-Reciprocal square root. Hardware instruction: FVRSQRT (funct7=0x03).
+Reciprocal square root. Hardware instruction: FRSQRT (funct7=0x03).
 
 ```python
 @irdl_op_definition
-class FVRsqrtOp(IRDLOperation):
-    name = "npu.fvrsqrt"
+class FRsqrtOp(IRDLOperation):
+    name = "npu.frsqrt"
     src = operand_def(MemRefType)          # rank-0 memref (single float address)
     result = result_def(Float32Type)       # scalar result: 1/sqrt(src)
     traits = frozenset()
@@ -351,8 +351,8 @@ When LinalgToNpu encounters a broadcast-mul generic with `arrax.rmsnorm_divisor`
 1. Load the dot result from rank-0 memref (scalar forwarding if possible)
 2. Emit `arith.DivfOp(%sumsq, N_const)` → `%meansq` (becomes fdiv.s at asm time)
 3. Emit `arith.AddfOp(%meansq, eps_const)` → `%shifted` (becomes fadd.s at asm time)
-4. Store `%shifted` to a `memref.alloca<f32>` scratch (FVRSQRT reads from memory)
-5. Emit `npu.FVRsqrtOp(%scratch)` → `%scale`
+4. Store `%shifted` to a `memref.alloca<f32>` scratch (FRSQRT reads from memory)
+5. Emit `npu.FRsqrtOp(%scratch)` → `%scale`
 6. Emit `npu.FVMulOp(%src, %dst, %n, %scale)` (runtime scalar)
 
 This follows the `arrax.mean_divisor` precedent: attributes encode the composite operation's inter-step scalar math, LinalgToNpu emits the actual instructions.
@@ -374,11 +374,11 @@ This follows the `arrax.mean_divisor` precedent: attributes encode the composite
 
 The scalar register (fs?) is looked up from the register pool.
 
-### FVRsqrtOp
+### FRsqrtOp
 
 ```asm
     # addr already in a general-purpose register (from rank-0 memref base pointer)
-    .insn r 0x2B, 0x0, 0x03, fd, rs1, x0    # FVRSQRT: f[rd] = 1/sqrt(mem[rs1])
+    .insn r 0x2B, 0x0, 0x03, fd, rs1, x0    # FRSQRT: f[rd] = 1/sqrt(mem[rs1])
 ```
 
 Result goes to a float register managed by the pool.
@@ -423,7 +423,7 @@ Each phase is independently testable. Phases 1-2 are infrastructure. Phase 3 is 
 
 **Unit tests** for each new component:
 - Broadcast binary linalg patterns (IR structure tests)
-- FVSubScalarOp/FVRsqrtOp verify_ and asm emission
+- FVSubScalarOp/FRsqrtOp verify_ and asm emission
 - Tile pass with rank-0 broadcast operands
 - Softmax and rmsnorm ArrayToLinalg decomposition (IR structure)
 - Runtime scalar facc load in asm emitter
@@ -451,8 +451,8 @@ The `(d0) -> ()` broadcast map on a linalg.generic input is standard MLIR but ma
 **Risk: FVMulOp/FVDivOp refactor breaks existing tests.**
 Changing from property to SSA operand touches working code. Mitigation: Phase 2 refactors the ops and immediately runs the full test suite to verify no regressions. The change is mechanical — every call site just wraps the float value in an arith.ConstantOp.
 
-**Risk: FVRSQRT memory operand after scalar forwarding.**
-FVRSQRT reads from a memory address. After scalar forwarding, the value is SSA f32 (no memref). Mitigation: LinalgToNpu emits `memref.alloca + memref.store` to put the value in memory before FVRSQRT. One extra store, acceptable overhead for one instruction.
+**Risk: FRSQRT memory operand after scalar forwarding.**
+FRSQRT reads from a memory address. After scalar forwarding, the value is SSA f32 (no memref). Mitigation: LinalgToNpu emits `memref.alloca + memref.store` to put the value in memory before FRSQRT. One extra store, acceptable overhead for one instruction.
 
 **Risk: softmax numerical stability for large values.**
 The max-subtraction step prevents overflow in exp(). If the max is not correctly computed (e.g., due to a tiling bug), exp() produces inf. Mitigation: E2E tests include large-value inputs where stability matters.
@@ -529,14 +529,14 @@ The max-subtraction step prevents overflow in exp(). If the max is not correctly
    - `asm_emitter.py`: Add `_emit_fvsub_scalar`. Sequence: load scalar into facc (FRSTACC, materialize 1.0 into ft0, FMACC pool_reg * ft0), load n into t0, emit `.insn r 0x2B, 0x0, 0x0C, t0, src_reg, dst_reg`. Add FVSubScalarOp to the import list and dispatch.
 3. **VERIFY**: Unit tests pass.
 
-#### Step 2.3: FVRsqrtOp dialect + asm emission
+#### Step 2.3: FRsqrtOp dialect + asm emission
 
 **Files**: `src/arrax/dialects/npu_dialect.py`, `src/arrax/codegen/asm_emitter.py`, `tests/dialects/test_npu_dialect.py`
 
-1. **RED**: Write unit test for FVRsqrtOp creation/verify. Write asm emission test checking `.insn r 0x2B, 0x0, 0x03`.
+1. **RED**: Write unit test for FRsqrtOp creation/verify. Write asm emission test checking `.insn r 0x2B, 0x0, 0x03`.
 2. **GREEN**:
-   - `npu_dialect.py`: Add FVRsqrtOp with operands: src (MemRefType, rank-0), result (Float32Type). Verify src is rank-0 f32 memref.
-   - `asm_emitter.py`: Add `_emit_fvrsqrt`. Load src base address into a GPR (from reg_map), allocate pool register for result, emit `.insn r 0x2B, 0x0, 0x03, fd, rs1, x0`. Bind result to pool register.
+   - `npu_dialect.py`: Add FRsqrtOp with operands: src (MemRefType, rank-0), result (Float32Type). Verify src is rank-0 f32 memref.
+   - `asm_emitter.py`: Add `_emit_frsqrt`. Load src base address into a GPR (from reg_map), allocate pool register for result, emit `.insn r 0x2B, 0x0, 0x03, fd, rs1, x0`. Bind result to pool register.
 3. **VERIFY**: Unit tests pass.
 
 #### Step 2.4: Scalar arith emission (fdiv.s, fadd.s)
@@ -649,7 +649,7 @@ The max-subtraction step prevents overflow in exp(). If the max is not correctly
 
 **Files**: `src/arrax/lowering/linalg_to_npu.py`, `tests/lowering/test_linalg_to_npu.py`
 
-1. **RED**: Write test that constructs a broadcast-mul generic with `arrax.rmsnorm_divisor` and `arrax.rmsnorm_eps` attributes (post-bufferize), runs LinalgToNpuPass, and verifies the output contains: `memref.load` (or forwarded SSA), `arith.divf`, `arith.addf`, `memref.alloca`, `memref.store`, `npu.fvrsqrt`, `npu.fvmul`.
+1. **RED**: Write test that constructs a broadcast-mul generic with `arrax.rmsnorm_divisor` and `arrax.rmsnorm_eps` attributes (post-bufferize), runs LinalgToNpuPass, and verifies the output contains: `memref.load` (or forwarded SSA), `arith.divf`, `arith.addf`, `memref.alloca`, `memref.store`, `npu.frsqrt`, `npu.fvmul`.
 2. **GREEN**: Extend `LinalgBroadcastBinaryToNpuPattern` (from Phase 3):
    - After loading the scalar from the rank-0 memref (or forwarding), check for `arrax.rmsnorm_divisor` attribute.
    - If present: extract N and eps from attributes. Emit:
@@ -658,8 +658,8 @@ The max-subtraction step prevents overflow in exp(). If the max is not correctly
      - `arith.ConstantOp(FloatAttr(eps, f32))` → `%eps`
      - `arith.AddfOp(%meansq, %eps)` → `%shifted`
      - `memref.AllocaOp(f32, shape=[])` → `%scratch`
-     - `memref.StoreOp(%shifted, %scratch, [])` (FVRSQRT reads from memory)
-     - `FVRsqrtOp(%scratch)` → `%scale`
+     - `memref.StoreOp(%shifted, %scratch, [])` (FRSQRT reads from memory)
+     - `FRsqrtOp(%scratch)` → `%scale`
      - `FVMulOp(%src, %dst, %n, %scale)` (runtime scalar)
    - If not present: emit the plain broadcast pattern (from Phase 3).
 3. **VERIFY**: Tests pass.
