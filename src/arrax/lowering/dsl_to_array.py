@@ -20,41 +20,6 @@ from arrax.dialects.array_dialect import (
 )
 from arrax.dsl.array import Array
 
-# Reduction ops are restricted to the root of the DAG in Milestone 3.
-# Milestone 4 lifts this by deleting _REDUCTION_OPS and the validator below.
-_REDUCTION_OPS = frozenset({"sum", "dot", "amax", "mean"})
-
-
-def _validate_reductions_terminal(root: Array) -> None:
-    """Walk the DAG and ensure reduction ops appear only as the root.
-
-    A reduction is "terminal" when no other node in the DAG references it
-    as an operand. M3 only supports terminal reductions; a non-terminal
-    reduction raises ValueError and must be split across compiled functions.
-    """
-    # Collect the set of nodes that appear as an operand of some other node.
-    # The root is the only node guaranteed not to be in this set.
-    non_root_ids: set[int] = set()
-    visited: set[int] = set()
-
-    def walk(node: Array) -> None:
-        if id(node) in visited:
-            return
-        visited.add(id(node))
-        for child in node.operands:
-            non_root_ids.add(id(child))
-            walk(child)
-
-    walk(root)
-
-    for node in visited_nodes(root):
-        if node.op in _REDUCTION_OPS and id(node) in non_root_ids:
-            raise ValueError(
-                f"reduction `{node.op}` is used non-terminally; milestone 3 "
-                f"only supports reductions as the function's return value. "
-                f"Compile a separate function for intermediate scalars."
-            )
-
 
 def visited_nodes(root: Array) -> list[Array]:
     """Return every unique DAG node reachable from root."""
@@ -83,8 +48,6 @@ def dsl_to_array(
     Walks the DAG bottom-up, mapping each Array node to an SSA value.
     Leaf nodes become function arguments; op nodes become dialect operations.
     """
-    _validate_reductions_terminal(result)
-
     f32 = Float32Type()
 
     # Build function argument types in signature order

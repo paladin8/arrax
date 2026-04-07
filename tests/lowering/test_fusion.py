@@ -146,13 +146,14 @@ class TestFusion:
         assert "iter_args" in ir
 
     def test_facc_tag_present_after_tile(self) -> None:
-        """arrax.uses_facc attribute survives through bufferize + tile."""
+        """arrax.facc attribute survives through bufferize + tile."""
         module = make_module(
             lambda A, B: dot(A * 2.0, B), {"A": (128,), "B": (128,)}
         )
         tile(module)
         ir = str(module)
-        assert ir.count("arrax.uses_facc") >= 2  # scalar-vec + dot
+        assert '"ephemeral"' in ir  # scalar-vec mul
+        assert '"persistent"' in ir  # dot product
 
     def test_parallel_reduction_fusion_untiled_no_op(self) -> None:
         """sum(A + B) at N=32: no tiling, no loops, nothing to fuse."""

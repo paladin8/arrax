@@ -13,7 +13,7 @@ from xdsl.dialects.builtin import (
     IntegerAttr,
     ModuleOp,
     TensorType,
-    UnitAttr,
+    StringAttr,
     i64,
 )
 from xdsl.dialects.linalg import IteratorTypeAttr
@@ -216,7 +216,7 @@ class MulScalarToLinalgPattern(RewritePattern):
             iterator_types=iters,
             result_types=[result_type],
         )
-        generic.attributes["arrax.uses_facc"] = UnitAttr()
+        generic.attributes["arrax.facc"] = StringAttr("ephemeral")
         rewriter.replace_matched_op([empty, generic], [generic.res[0]])
 
 
@@ -252,7 +252,7 @@ class DivScalarToLinalgPattern(RewritePattern):
             iterator_types=iters,
             result_types=[result_type],
         )
-        generic.attributes["arrax.uses_facc"] = UnitAttr()
+        generic.attributes["arrax.facc"] = StringAttr("ephemeral")
         rewriter.replace_matched_op([empty, generic], [generic.res[0]])
 
 
@@ -426,7 +426,7 @@ class DotToLinalgPattern(RewritePattern):
             iterator_types=iters,
             result_types=[result_type],
         )
-        generic.attributes["arrax.uses_facc"] = UnitAttr()
+        generic.attributes["arrax.facc"] = StringAttr("persistent")
         rewriter.replace_matched_op(
             [empty, zero, fill, generic], [generic.res[0]]
         )

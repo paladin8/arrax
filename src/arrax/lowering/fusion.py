@@ -13,9 +13,10 @@ Two fusion cases are handled:
      spliced before the second loop's body; the second loop (with iter_args)
      survives.
 
-A facc conflict guard prevents fusing two loops that both contain ops
-tagged ``arrax.uses_facc`` (set by ArrayToLinalg for ops that require
-exclusive use of the hardware facc register).
+A facc conflict guard uses a read-write lock model on the ``arrax.facc``
+attribute: ``"persistent"`` ops (dot product) hold facc across the entire
+loop and block fusion, while ``"ephemeral"`` ops (scalar-vec mul/div)
+use facc within a single iteration and can coexist.
 
 Pipeline placement: after Tile, before LinalgToNpu.
 """
@@ -199,21 +200,36 @@ def _fuse_parallel_into_reduction(
 def _has_facc_conflict(first: scf.ForOp, second: scf.ForOp) -> bool:
     """Check if fusing would create a facc register conflict.
 
-    Ops tagged with the ``arrax.uses_facc`` discardable attribute (set by
-    ArrayToLinalg) require exclusive use of the hardware facc register.
-    If both loops contain such ops, fusing them would corrupt facc.
+    Uses a read-write lock model on the ``arrax.facc`` StringAttr:
+    - ``"persistent"``: facc accumulates across the entire loop (e.g. dot
+      product). Exclusive — cannot coexist with any other facc usage.
+    - ``"ephemeral"``: facc is loaded and consumed within a single iteration
+      (e.g. scalar-vector mul/div, broadcast ops). Multiple ephemeral ops
+      can coexist in the same fused loop.
+    - No attribute: does not touch facc. Always safe.
+
+    Fusion is blocked when a ``"persistent"`` op would coexist with any
+    other facc usage (``"ephemeral"`` or ``"persistent"``).
     """
-    def _uses_facc(loop: scf.ForOp) -> bool:
+    def _facc_level(loop: scf.ForOp) -> str:
         body = loop.body.blocks.first
         if body is None:
-            return False
-        return any(
-            isinstance(op, linalg.GenericOp)
-            and "arrax.uses_facc" in op.attributes
-            for op in body.ops
-        )
+            return "none"
+        level = "none"
+        for op in body.ops:
+            if isinstance(op, linalg.GenericOp) and "arrax.facc" in op.attributes:
+                val = op.attributes["arrax.facc"]
+                if hasattr(val, "data") and val.data == "persistent":
+                    return "persistent"
+                level = "ephemeral"
+        return level
 
-    return _uses_facc(first) and _uses_facc(second)
+    a, b = _facc_level(first), _facc_level(second)
+    if a == "persistent" and b != "none":
+        return True
+    if b == "persistent" and a != "none":
+        return True
+    return False
 
 
 def _fuse_block(block: Block) -> bool:

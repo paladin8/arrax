@@ -119,36 +119,53 @@ class TileLinalgPattern(RewritePattern):
 
         subview_type = _dynamic_subview_type(out_type)
 
-        # Create subviews for all inputs and the output
-        subviews = []
-        for memref_val in list(inputs) + list(outputs):
-            sv = memref.SubviewOp.get(
-                source=memref_val,
-                offsets=[iv],
-                sizes=[chunk.result],
-                strides=[1],
-                result_type=subview_type,
-            )
-            subviews.append(sv)
+        # Create subviews for rank-1 inputs; rank-0 broadcast operands
+        # pass through unchanged (you can't subview a scalar memref).
+        subview_ops: list[memref.SubviewOp] = []
+        tiled_inputs: list[SSAValue] = []
+        for memref_val in inputs:
+            mt = memref_val.type
+            if isinstance(mt, MemRefType) and len(mt.get_shape()) == 0:
+                tiled_inputs.append(memref_val)
+            else:
+                sv = memref.SubviewOp.get(
+                    source=memref_val,
+                    offsets=[iv],
+                    sizes=[chunk.result],
+                    strides=[1],
+                    result_type=subview_type,
+                )
+                subview_ops.append(sv)
+                tiled_inputs.append(sv.result)
 
-        # Clone the linalg.generic with subviewed operands
+        # Output is always rank-1 — subview as before.
+        out_sv = memref.SubviewOp.get(
+            source=outputs[0],
+            offsets=[iv],
+            sizes=[chunk.result],
+            strides=[1],
+            result_type=subview_type,
+        )
+        subview_ops.append(out_sv)
+
+        # Clone the linalg.generic with tiled operands
         new_body = op.body.clone()
         new_generic = linalg.GenericOp(
-            inputs=[sv.result for sv in subviews[: len(inputs)]],
-            outputs=[subviews[-1].result],
+            inputs=tiled_inputs,
+            outputs=[out_sv.result],
             body=new_body,
             indexing_maps=op.indexing_maps,
             iterator_types=op.iterator_types,
             result_types=[],
         )
-        # Preserve discardable attributes (e.g. arrax.uses_facc).
+        # Preserve discardable attributes (e.g. arrax.facc).
         for name, attr in op.attributes.items():
             if name not in new_generic.attributes:
                 new_generic.attributes[name] = attr
 
         yield_op = scf.YieldOp()
 
-        body_block.add_ops([remaining, chunk, *subviews, new_generic, yield_op])
+        body_block.add_ops([remaining, chunk, *subview_ops, new_generic, yield_op])
 
         for_op = scf.ForOp(c0.result, cn.result, cstep.result, [], Region([body_block]))
 

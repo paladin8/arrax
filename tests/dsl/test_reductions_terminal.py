@@ -1,14 +1,12 @@
-"""Tests for the reduction terminal-only validator.
+"""Tests for reduction usage patterns in dsl_to_array.
 
-Milestone 3 restricts reductions (sum, dot, amax, mean) to be the root of
-the traced DAG — the function's return value. Any use as an operand to
-another op raises ValueError. This test pins that restriction and exists
-so that Milestone 4 can delete both the validator and this test together.
+M3 restricted reductions to terminal (root-only) positions. M4 lifts that
+restriction — reductions can now appear anywhere in the DAG and feed into
+subsequent ops. This file tests both terminal (accepted since M3) and
+non-terminal (accepted since M4) patterns.
 """
 
 from __future__ import annotations
-
-import pytest
 
 from arrax.dsl.array import Array, amax, dot, mean, sum
 from arrax.dsl.tracer import trace
@@ -55,55 +53,47 @@ class TestAcceptedReductions:
         _compile_to_array(lambda A, B: mean(A + B), {"A": (64,), "B": (64,)})
 
 
-class TestRejectedReductions:
-    def test_sum_fed_into_add_raises(self) -> None:
-        """A + sum(A) — sum has a non-root user (the add)."""
-        a = Array("A", (64,))
-        # Build DAG manually so we can pass a non-terminal sum directly.
-        s = sum(a)
-        # A + s — add's second operand is a rank-0 value, a DAG violation for M3.
-        root = Array(name="", shape=(64,))
-        root.op = "add"
-        root.operands = [a, s]
-        with pytest.raises(ValueError, match="terminal"):
-            dsl_to_array(root, ["A"], {"A": (64,)})
+class TestNonTerminalReductions:
+    """M4: non-terminal reductions pass through dsl_to_array without raising.
 
-    def test_error_names_offending_reduction(self) -> None:
+    The validator that blocked these patterns in M3 is removed. The resulting
+    IR may contain shape mismatches at the array dialect level (e.g., AddOp
+    with rank-1 and rank-0 operands) — that's expected. Non-terminal reductions
+    are used internally by composite op decompositions (softmax, rmsnorm) at
+    the linalg level, not at the array dialect level.
+    """
+
+    def _build_non_terminal(
+        self, reduction_node: Array, other: Array, params: list[str], shapes: dict
+    ) -> None:
+        """Build a DAG where a reduction feeds into an add, then lower."""
+        root = Array(name="", shape=other.shape)
+        root.op = "add"
+        root.operands = [other, reduction_node]
+        # Should not raise ValueError — the M3 terminal validator is gone.
+        dsl_to_array(root, params, shapes)
+
+    def test_sum_fed_into_add(self) -> None:
+        """A + sum(A) — sum is non-terminal, dsl_to_array should not reject."""
         a = Array("A", (64,))
         s = sum(a)
-        root = Array(name="", shape=(64,))
-        root.op = "add"
-        root.operands = [a, s]
-        with pytest.raises(ValueError, match="sum"):
-            dsl_to_array(root, ["A"], {"A": (64,)})
+        self._build_non_terminal(s, a, ["A"], {"A": (64,)})
 
-    def test_amax_fed_into_add_raises(self) -> None:
-        """A + amax(A) — amax has a non-root user (the add)."""
+    def test_amax_fed_into_add(self) -> None:
+        """A + amax(A) — amax is non-terminal, dsl_to_array should not reject."""
         a = Array("A", (64,))
         m = amax(a)
-        root = Array(name="", shape=(64,))
-        root.op = "add"
-        root.operands = [a, m]
-        with pytest.raises(ValueError, match="amax"):
-            dsl_to_array(root, ["A"], {"A": (64,)})
+        self._build_non_terminal(m, a, ["A"], {"A": (64,)})
 
-    def test_dot_fed_into_add_raises(self) -> None:
-        """A + dot(A, B) — dot has a non-root user."""
+    def test_dot_fed_into_add(self) -> None:
+        """A + dot(A, B) — dot is non-terminal, dsl_to_array should not reject."""
         a = Array("A", (64,))
         b = Array("B", (64,))
         d = dot(a, b)
-        root = Array(name="", shape=(64,))
-        root.op = "add"
-        root.operands = [a, d]
-        with pytest.raises(ValueError, match="dot"):
-            dsl_to_array(root, ["A", "B"], {"A": (64,), "B": (64,)})
+        self._build_non_terminal(d, a, ["A", "B"], {"A": (64,), "B": (64,)})
 
-    def test_mean_fed_into_add_raises(self) -> None:
-        """A + mean(A) — mean has a non-root user."""
+    def test_mean_fed_into_add(self) -> None:
+        """A + mean(A) — mean is non-terminal, dsl_to_array should not reject."""
         a = Array("A", (64,))
         m = mean(a)
-        root = Array(name="", shape=(64,))
-        root.op = "add"
-        root.operands = [a, m]
-        with pytest.raises(ValueError, match="mean"):
-            dsl_to_array(root, ["A"], {"A": (64,)})
+        self._build_non_terminal(m, a, ["A"], {"A": (64,)})
