@@ -8,7 +8,7 @@ import numpy as np
 from riscv_npu import Emulator
 
 from arrax.codegen.build import build_elf
-from arrax.dsl.array import Array, amax, dot, exp, mean, relu, softmax
+from arrax.dsl.array import Array, amax, dot, exp, mean, relu, rmsnorm, softmax
 from arrax.dsl.array import sum as arr_sum
 from arrax.pipeline import compile_to_asm
 
@@ -992,5 +992,74 @@ class TestEndToEnd:
             {"A": (N,), "B": (N,)},
             {"A": A, "B": B},
             tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+
+    # --- rmsnorm ---
+
+    def test_rmsnorm_basic(self, tmp_path: Path) -> None:
+        """rmsnorm(A) with N=128 (tiled)."""
+        N = 128
+        A = np.random.default_rng(42).standard_normal(N).astype(np.float32)
+        expected = A / np.sqrt(np.mean(A**2) + 1e-5)
+
+        actual, _ = _compile_and_run(
+            lambda A: rmsnorm(A), {"A": (N,)}, {"A": A}, tmp_path
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+
+    def test_rmsnorm_small(self, tmp_path: Path) -> None:
+        """rmsnorm(A) with N=32 (untiled)."""
+        N = 32
+        A = np.random.default_rng(7).standard_normal(N).astype(np.float32)
+        expected = A / np.sqrt(np.mean(A**2) + 1e-5)
+
+        actual, _ = _compile_and_run(
+            lambda A: rmsnorm(A), {"A": (N,)}, {"A": A}, tmp_path
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+
+    def test_rmsnorm_exact_tile(self, tmp_path: Path) -> None:
+        """rmsnorm(A) with N=64 (exactly at tile boundary)."""
+        N = 64
+        A = np.random.default_rng(13).standard_normal(N).astype(np.float32)
+        expected = A / np.sqrt(np.mean(A**2) + 1e-5)
+
+        actual, _ = _compile_and_run(
+            lambda A: rmsnorm(A), {"A": (N,)}, {"A": A}, tmp_path
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+
+    def test_rmsnorm_non_multiple(self, tmp_path: Path) -> None:
+        """rmsnorm(A) with N=135 (non-multiple of 64)."""
+        N = 135
+        A = np.random.default_rng(99).standard_normal(N).astype(np.float32)
+        expected = A / np.sqrt(np.mean(A**2) + 1e-5)
+
+        actual, _ = _compile_and_run(
+            lambda A: rmsnorm(A), {"A": (N,)}, {"A": A}, tmp_path
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+
+    def test_rmsnorm_near_zero(self, tmp_path: Path) -> None:
+        """rmsnorm with very small values — eps prevents division by zero."""
+        N = 128
+        A = np.full(N, 1e-10, dtype=np.float32)
+        expected = A / np.sqrt(np.mean(A**2) + 1e-5)
+
+        actual, _ = _compile_and_run(
+            lambda A: rmsnorm(A), {"A": (N,)}, {"A": A}, tmp_path
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+
+    def test_rmsnorm_of_relu(self, tmp_path: Path) -> None:
+        """rmsnorm(relu(A)): elementwise producer fused before rmsnorm."""
+        N = 128
+        A = np.random.default_rng(42).standard_normal(N).astype(np.float32)
+        x = np.maximum(A, 0.0)
+        expected = x / np.sqrt(np.mean(x**2) + 1e-5)
+
+        actual, _ = _compile_and_run(
+            lambda A: rmsnorm(relu(A)), {"A": (N,)}, {"A": A}, tmp_path
         )
         np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)

@@ -6,7 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from xdsl.context import Context
-from xdsl.dialects import arith, linalg, math, memref
+from xdsl.dialects import arith, linalg, math, memref, scf
 from xdsl.dialects.builtin import (
     DYNAMIC_INDEX,
     Float32Type,
@@ -31,6 +31,7 @@ from xdsl.pattern_rewriter import (
 )
 
 from arrax.dialects.npu_dialect import (
+    FRsqrtOp,
     FVAddOp,
     FVDivOp,
     FVExpOp,
@@ -319,6 +320,51 @@ class LinalgBroadcastBinaryToNpuPattern(RewritePattern):
             load_op = memref.LoadOp.get(scalar_operand, [])
             extra_ops.append(load_op)
             scalar_val = load_op.res
+
+        # RMSNorm scalar math: if the broadcast-mul has rmsnorm attributes,
+        # apply divf(sumsq, N), addf(meansq, eps), store to scratch, frsqrt
+        # before the final fvmul. The scalar math must be hoisted BEFORE the
+        # containing scf.for (if tiled) so it executes once, not per-tile.
+        if npu_op_type == "mul" and "arrax.rmsnorm_divisor" in op.attributes:
+            f32 = Float32Type()
+            divisor_attr = op.attributes["arrax.rmsnorm_divisor"]
+            eps_attr = op.attributes["arrax.rmsnorm_eps"]
+            n_val = float(divisor_attr.value.data)
+            eps_val = eps_attr.value.data
+
+            # Build the scalar math op sequence. If scalar_val came from
+            # a memref.load fallback (not forwarded), include the load in
+            # the hoisted ops to avoid a dominance violation.
+            hoist_ops: list[Operation] = []
+            if scalar_val.owner in extra_ops:
+                # Move the load from extra_ops into hoist_ops
+                extra_ops.remove(scalar_val.owner)
+                hoist_ops.append(scalar_val.owner)
+
+            n_const = arith.ConstantOp(FloatAttr(n_val, f32))
+            meansq = arith.DivfOp(scalar_val, n_const.result)
+            eps_const = arith.ConstantOp(FloatAttr(eps_val, f32))
+            shifted = arith.AddfOp(meansq.result, eps_const.result)
+            scratch = memref.AllocaOp.get(f32, shape=[])
+            store = memref.StoreOp.get(shifted.result, scratch.memref, [])
+            rsqrt = FRsqrtOp(scratch.memref)
+            hoist_ops.extend([
+                n_const, meansq, eps_const, shifted, scratch, store, rsqrt,
+            ])
+
+            # Hoist scalar math before the containing scf.for (if inside one).
+            parent = op.parent_op()
+            if isinstance(parent, scf.ForOp):
+                parent_block = parent.parent_block()
+                assert parent_block is not None
+                for sop in hoist_ops:
+                    parent_block.insert_op_before(sop, parent)
+            else:
+                extra_ops.extend(hoist_ops)
+
+            npu_op = FVMulOp(vec_operand, outputs[0], n_ssa, rsqrt.result)
+            rewriter.replace_matched_op([*extra_ops, npu_op], [])
+            return
 
         # Emit the appropriate NPU op
         out = outputs[0]

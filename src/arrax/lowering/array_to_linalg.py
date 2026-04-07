@@ -48,6 +48,7 @@ from arrax.dialects.array_dialect import (
     ExpOp,
     MeanOp,
     MulScalarOp,
+    RMSNormOp,
     ReluOp,
     SoftmaxOp,
     SubOp,
@@ -455,6 +456,54 @@ class SoftmaxToLinalgPattern(RewritePattern):
         rewriter.replace_matched_op(all_ops, [div_result])
 
 
+class RMSNormToLinalgPattern(RewritePattern):
+    """Decompose array.rmsnorm into dot(x,x) + attributed broadcast-mul.
+
+    rmsnorm(x) = x / sqrt(mean(x^2) + eps)
+
+    Step 1: dot(x, x) reduction (sum of squares), tagged arrax.facc="persistent".
+    Step 2: broadcast-mul with arrax.rmsnorm_divisor and arrax.rmsnorm_eps
+    attributes. LinalgToNpu reads these to emit the scalar math (divf, addf,
+    frsqrt) between loading the reduction result and executing fvmul.
+    """
+
+    @op_type_rewrite_pattern
+    def match_and_rewrite(
+        self, op: RMSNormOp, rewriter: PatternRewriter
+    ) -> None:
+        input_type = op.input.type
+        assert isinstance(input_type, TensorType)
+        f32 = Float32Type()
+        n = input_type.get_shape()[0]
+        vec_type = input_type
+        scalar_type = TensorType(f32, [])
+
+        all_ops: list[Operation] = []
+
+        # Step 1: dot(x, x) — sum of squares
+        def _dot_body(args: list[SSAValue]) -> tuple[list[Operation], SSAValue]:
+            # args: [in_a, in_b, acc]
+            mul = arith.MulfOp(args[0], args[1])
+            add = arith.AddfOp(args[2], mul.result)
+            return [mul, add], add.result
+
+        dot_ops, dot_result = _emit_reduction(
+            [op.input, op.input], 0.0, _dot_body, scalar_type,
+        )
+        dot_ops[-1].attributes["arrax.facc"] = StringAttr("persistent")
+        all_ops.extend(dot_ops)
+
+        # Step 2: broadcast-mul with rmsnorm attributes
+        mul_ops, mul_result = _emit_broadcast_binary(
+            op.input, dot_result, arith.MulfOp, vec_type,
+        )
+        mul_ops[-1].attributes["arrax.rmsnorm_divisor"] = IntegerAttr(n, i64)
+        mul_ops[-1].attributes["arrax.rmsnorm_eps"] = FloatAttr(1e-5, f32)
+        all_ops.extend(mul_ops)
+
+        rewriter.replace_matched_op(all_ops, [mul_result])
+
+
 @dataclass(frozen=True)
 class ArrayToLinalgPass(ModulePass):
     """Lower array dialect ops to linalg.generic on tensors."""
@@ -475,5 +524,6 @@ class ArrayToLinalgPass(ModulePass):
                 DotToLinalgPattern(),
                 MeanToLinalgPattern(),
                 SoftmaxToLinalgPattern(),
+                RMSNormToLinalgPattern(),
             ])
         ).rewrite_module(op)

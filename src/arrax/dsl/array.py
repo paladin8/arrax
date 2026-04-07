@@ -135,3 +135,15 @@ def softmax(x: Array) -> Array:
     result.op = "softmax"
     result.operands = [x]
     return result
+
+
+def rmsnorm(x: Array) -> Array:
+    """RMSNorm (no gamma): x / sqrt(mean(x^2) + eps). Returns same shape.
+
+    Decomposed in the compiler into dot(x,x) reduction + scalar math
+    (div by N, add eps, rsqrt) + broadcast-mul. Hardcoded eps=1e-5.
+    """
+    result = Array(name="", shape=x.shape)
+    result.op = "rmsnorm"
+    result.operands = [x]
+    return result

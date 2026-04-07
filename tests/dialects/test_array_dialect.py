@@ -17,6 +17,7 @@ from arrax.dialects.array_dialect import (
     ExpOp,
     MeanOp,
     MulScalarOp,
+    RMSNormOp,
     ReluOp,
     SoftmaxOp,
     SubOp,
@@ -531,4 +532,37 @@ class TestSoftmaxOp:
         module = ModuleOp([input_val.owner, op])
         ir = str(module)
         assert "array.softmax" in ir
+        assert "tensor<128xf32>" in ir
+
+
+class TestRMSNormOp:
+    def test_construction(self) -> None:
+        tensor_type = TensorType(Float32Type(), [128])
+        input_val = create_ssa_value(tensor_type)
+        op = RMSNormOp(input_val)
+        assert op.input == input_val
+        assert op.result.type == tensor_type
+
+    def test_verify(self) -> None:
+        tensor_type = TensorType(Float32Type(), [128])
+        input_val = create_ssa_value(tensor_type)
+        op = RMSNormOp(input_val)
+        op.verify()
+
+    def test_verify_rank0_fails(self) -> None:
+        input_val = create_ssa_value(TensorType(Float32Type(), []))
+        op = RMSNormOp(input_val)
+        with pytest.raises(VerifyException, match="rank-1"):
+            op.verify()
+
+    def test_dialect_contains_rmsnorm(self) -> None:
+        assert RMSNormOp in ArrayDialect._operations
+
+    def test_ir_prints_correctly(self) -> None:
+        tensor_type = TensorType(Float32Type(), [128])
+        input_val = create_ssa_value(tensor_type)
+        op = RMSNormOp(input_val)
+        module = ModuleOp([input_val.owner, op])
+        ir = str(module)
+        assert "array.rmsnorm" in ir
         assert "tensor<128xf32>" in ir

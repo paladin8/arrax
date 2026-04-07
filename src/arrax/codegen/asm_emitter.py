@@ -334,6 +334,8 @@ class _AsmEmitter:
             self._emit_scalar_fp_binop(op, "fdiv.s")
         elif isinstance(op, arith.AddfOp):
             self._emit_scalar_fp_binop(op, "fadd.s")
+        elif isinstance(op, memref.AllocaOp):
+            self._emit_alloca(op)
         elif isinstance(op, scf.YieldOp):
             self._emit_yield(op)
         elif isinstance(op, Operation):
@@ -374,21 +376,32 @@ class _AsmEmitter:
                 f"asm_emitter: unsupported constant type {op.value}"
             )
 
-    def _emit_alloc(self, op: memref.AllocOp) -> None:
-        """Emit .comm for static buffer allocation, load address into s-register."""
-        assert isinstance(op.memref.type, MemRefType)
-        shape = op.memref.type.get_shape()
-        size = 1
+    def _emit_mem_alloc(self, memref_val: SSAValue) -> None:
+        """Emit .comm for a buffer allocation, load address into s-register.
+
+        Used by both memref.alloc (heap) and memref.alloca (stack). On the
+        NPU's flat memory model they are equivalent.
+        """
+        assert isinstance(memref_val.type, MemRefType)
+        shape = memref_val.type.get_shape()
+        size = 4  # f32 = 4 bytes per element
         for dim in shape:
             size *= dim
-        size *= 4  # f32 = 4 bytes per element
 
         sym = f".Lbuf_{self._label_count}"
         self._label_count += 1
         sreg = self._alloc_s_reg()
         self._bss.append(f"    .comm {sym}, {size}, 4")
         self._lines.append(f"    la {sreg}, {sym}")
-        self._reg_map[id(op.memref)] = sreg
+        self._reg_map[id(memref_val)] = sreg
+
+    def _emit_alloc(self, op: memref.AllocOp) -> None:
+        """Emit .comm for heap buffer allocation."""
+        self._emit_mem_alloc(op.memref)
+
+    def _emit_alloca(self, op: memref.AllocaOp) -> None:
+        """Emit .comm for stack-allocated buffer (e.g. rank-0 FRSQRT scratch)."""
+        self._emit_mem_alloc(op.memref)
 
     def _emit_for(self, op: scf.ForOp) -> None:
         """Emit a counted loop for scf.for, with optional f32 iter_args.

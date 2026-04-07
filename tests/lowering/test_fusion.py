@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from arrax.dsl.array import Array, amax, dot, exp, mean, relu, softmax
+from arrax.dsl.array import Array, amax, dot, exp, mean, relu, rmsnorm, softmax
 from arrax.dsl.array import sum as arr_sum
 from tests.helpers import fuse, make_module, tile
 
@@ -308,3 +308,32 @@ class TestFusion:
         ir = str(module)
         assert "scf.for" not in ir
         assert ir.count("linalg.generic") == 5
+
+    # --- rmsnorm fusion ---
+
+    def test_rmsnorm_fuses_to_two_loops(self) -> None:
+        """rmsnorm(A) at N=128: dot reduction + broadcast-mul = 2 loops.
+
+        Loop 1: dot(x,x) reduction
+        Scalar math: fdiv.s, fadd.s, frsqrt (between loops, not tiled)
+        Loop 2: mul by scale (broadcast)
+        """
+        module = make_module(lambda A: rmsnorm(A), {"A": (128,)})
+        fuse(module)
+        module.verify()
+        ir = str(module)
+        assert ir.count("scf.for") == 2
+        assert ir.count("linalg.generic") == 2
+        # One loop carries iter_args (dot reduction)
+        assert ir.count("iter_args") == 1
+
+    def test_rmsnorm_of_relu_fuses_producer(self) -> None:
+        """rmsnorm(relu(A)) at N=128: relu fuses into dot loop, still 2 loops."""
+        module = make_module(lambda A: rmsnorm(relu(A)), {"A": (128,)})
+        fuse(module)
+        module.verify()
+        ir = str(module)
+        # relu fuses into the dot reduction loop (parallel -> reduction)
+        assert ir.count("scf.for") == 2
+        # 3 generics: relu + 2 from rmsnorm
+        assert ir.count("linalg.generic") == 3
