@@ -14,7 +14,7 @@ claude plugin install superpowers@claude-plugins-official
 # Merge default model + effort into settings.json without clobbering the
 # plugin entries that `claude plugin install` just wrote.
 SETTINGS="$HOME/.claude/settings.json"
-jq '. + {model: "opus", effortLevel: "high"}' "$SETTINGS" > "$SETTINGS.tmp"
+jq '. + {model: "claude-opus-4-6[1m]", effortLevel: "high"}' "$SETTINGS" > "$SETTINGS.tmp"
 mv "$SETTINGS.tmp" "$SETTINGS"
 
 # --- Project dependencies ---------------------------------------------------
