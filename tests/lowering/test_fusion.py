@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from arrax.dsl.array import Array, amax, dot, exp, mean, relu
+from arrax.dsl.array import Array, amax, dot, exp, mean, relu, softmax
 from arrax.dsl.array import sum as arr_sum
 from tests.helpers import fuse, make_module, tile
 
@@ -268,3 +268,43 @@ class TestFusion:
         # Fewer loops after fusion
         assert ir_unfused.count("scf.for") == 2
         assert ir_fused.count("scf.for") == 1
+
+    # --- softmax fusion ---
+
+    def test_softmax_fuses_to_three_loops(self) -> None:
+        """softmax(A) at N=128: 5 generics fuse into 3 loops.
+
+        Loop 1: amax reduction
+        Loop 2: sub_broadcast + exp + sum (parallel+parallel+reduction)
+        Loop 3: div_broadcast (standalone)
+        """
+        module = make_module(lambda A: softmax(A), {"A": (128,)})
+        fuse(module)
+        module.verify()
+        ir = str(module)
+        assert ir.count("scf.for") == 3
+        assert ir.count("linalg.generic") == 5
+        # Two loops carry iter_args (amax and sum reductions)
+        assert ir.count("iter_args") == 2
+
+    def test_softmax_of_add_fuses_producer(self) -> None:
+        """softmax(A + B) at N=128: add fuses into amax loop, still 3 loops."""
+        module = make_module(
+            lambda A, B: softmax(A + B), {"A": (128,), "B": (128,)}
+        )
+        fuse(module)
+        module.verify()
+        ir = str(module)
+        # add fuses into the amax reduction loop (parallel -> reduction)
+        assert ir.count("scf.for") == 3
+        # 6 generics: add + 5 from softmax
+        assert ir.count("linalg.generic") == 6
+
+    def test_softmax_untiled_no_fusion(self) -> None:
+        """softmax(A) at N=32: no tiling, no loops, nothing to fuse."""
+        module = make_module(lambda A: softmax(A), {"A": (32,)})
+        fuse(module)
+        module.verify()
+        ir = str(module)
+        assert "scf.for" not in ir
+        assert ir.count("linalg.generic") == 5
