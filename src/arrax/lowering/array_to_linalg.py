@@ -3,11 +3,12 @@
 Each array dialect op is rewritten to one or more linalg.generic ops.
 Composite ops (softmax, rmsnorm) decompose into sequences of generics.
 
-Shared helpers factor out the four recurring linalg emission patterns:
+Shared helpers factor out the five recurring linalg emission patterns:
   - _emit_binary_elementwise: 2-input parallel (add, sub)
   - _emit_unary_elementwise: 1-input parallel (exp, relu, scalar mul/div)
   - _emit_reduction: fill + reduction generic (sum, amax, dot, mean)
   - _emit_broadcast_binary: vec + scalar broadcast parallel (softmax sub/div)
+  - _emit_rank0_unary: 0-iterator rank-0 scalar (rmsnorm divf, addf, rsqrt)
 """
 
 from __future__ import annotations
@@ -22,11 +23,9 @@ from xdsl.dialects.builtin import (
     AffineMapAttr,
     Float32Type,
     FloatAttr,
-    IntegerAttr,
     ModuleOp,
     StringAttr,
     TensorType,
-    i64,
 )
 from xdsl.dialects.linalg import IteratorTypeAttr
 from xdsl.ir import Block, Operation, Region, SSAValue
@@ -210,6 +209,40 @@ def _emit_broadcast_binary(
     return [empty, generic], generic.res[0]
 
 
+def _emit_rank0_unary(
+    input_val: SSAValue,
+    body_builder: BodyBuilder,
+    result_type: TensorType,
+) -> tuple[list[Operation], SSAValue]:
+    """Emit a rank-0 linalg.generic (0 iterators, scalar body).
+
+    Takes a rank-0 tensor input and produces a rank-0 tensor output.
+    ``body_builder`` receives ``[in_scalar, out_scalar]`` and returns
+    ``(body_ops, yield_value)``.
+    Used for scalar math between reductions and broadcast ops (e.g. rmsnorm's
+    divf, addf, rsqrt).
+    """
+    f32 = Float32Type()
+    empty = tensor.EmptyOp([], result_type)
+    scalar_map = AffineMap.from_callable(lambda: ())
+    maps = [AffineMapAttr(scalar_map), AffineMapAttr(scalar_map)]
+
+    block = Block(arg_types=[f32, f32])
+    body_ops, result_val = body_builder(list(block.args))
+    yield_op = linalg.YieldOp(result_val)
+    block.add_ops([*body_ops, yield_op])
+
+    generic = linalg.GenericOp(
+        inputs=[input_val],
+        outputs=[empty.tensor],
+        body=Region([block]),
+        indexing_maps=maps,
+        iterator_types=[],
+        result_types=[result_type],
+    )
+    return [empty, generic], generic.res[0]
+
+
 # ---------------------------------------------------------------------------
 # Pattern classes (one per array dialect op)
 # ---------------------------------------------------------------------------
@@ -367,11 +400,11 @@ class DotToLinalgPattern(RewritePattern):
 
 
 class MeanToLinalgPattern(RewritePattern):
-    """Rewrite array.mean to linalg.fill(0.0) + linalg.generic reduction.
+    """Rewrite array.mean to sum reduction + rank-0 divf(sum, N).
 
-    The generic carries an ``arrax.mean_divisor`` discardable attribute
-    holding the input length. Downstream passes read this to emit a
-    trailing ``fdiv.s`` after the reduction loop.
+    Decomposed into two ops: a standard sum reduction (identical to
+    SumToLinalgPattern) followed by a rank-0 divf generic that divides
+    by the input length.
     """
 
     @op_type_rewrite_pattern
@@ -380,15 +413,34 @@ class MeanToLinalgPattern(RewritePattern):
         assert isinstance(input_type, TensorType)
         result_type = op.result.type
         assert isinstance(result_type, TensorType)
+        f32 = Float32Type()
         n = input_type.get_shape()[0]
+        scalar_type = TensorType(f32, [])
 
-        def body(args: list[SSAValue]) -> tuple[list[Operation], SSAValue]:
+        all_ops: list[Operation] = []
+
+        # Step 1: sum reduction (identical to SumToLinalgPattern)
+        def _sum_body(args: list[SSAValue]) -> tuple[list[Operation], SSAValue]:
             add = arith.AddfOp(args[1], args[0])
             return [add], add.result
 
-        ops, result = _emit_reduction([op.input], 0.0, body, result_type)
-        ops[-1].attributes["arrax.mean_divisor"] = IntegerAttr(n, i64)
-        rewriter.replace_matched_op(ops, [result])
+        sum_ops, sum_result = _emit_reduction(
+            [op.input], 0.0, _sum_body, scalar_type,
+        )
+        all_ops.extend(sum_ops)
+
+        # Step 2: divide by N (rank-0 scalar math)
+        def _divf_body(args: list[SSAValue]) -> tuple[list[Operation], SSAValue]:
+            const = arith.ConstantOp(FloatAttr(float(n), f32))
+            div = arith.DivfOp(args[0], const.result)
+            return [const, div], div.result
+
+        div_ops, div_result = _emit_rank0_unary(
+            sum_result, _divf_body, result_type,
+        )
+        all_ops.extend(div_ops)
+
+        rewriter.replace_matched_op(all_ops, [div_result])
 
 
 class SoftmaxToLinalgPattern(RewritePattern):
@@ -457,14 +509,13 @@ class SoftmaxToLinalgPattern(RewritePattern):
 
 
 class RMSNormToLinalgPattern(RewritePattern):
-    """Decompose array.rmsnorm into dot(x,x) + attributed broadcast-mul.
+    """Decompose array.rmsnorm into dot + rank-0 scalar math + broadcast-mul.
 
     rmsnorm(x) = x / sqrt(mean(x^2) + eps)
 
-    Step 1: dot(x, x) reduction (sum of squares), tagged arrax.facc="persistent".
-    Step 2: broadcast-mul with arrax.rmsnorm_divisor and arrax.rmsnorm_eps
-    attributes. LinalgToNpu reads these to emit the scalar math (divf, addf,
-    frsqrt) between loading the reduction result and executing fvmul.
+    Emits: dot(x,x) reduction, rank-0 divf (÷N), rank-0 addf (+eps),
+    rank-0 rsqrt, broadcast-mul (x * scale). All scalar math is explicit
+    as rank-0 linalg.generic ops — no hidden attributes.
     """
 
     @op_type_rewrite_pattern
@@ -482,7 +533,6 @@ class RMSNormToLinalgPattern(RewritePattern):
 
         # Step 1: dot(x, x) — sum of squares
         def _dot_body(args: list[SSAValue]) -> tuple[list[Operation], SSAValue]:
-            # args: [in_a, in_b, acc]
             mul = arith.MulfOp(args[0], args[1])
             add = arith.AddfOp(args[2], mul.result)
             return [mul, add], add.result
@@ -493,12 +543,42 @@ class RMSNormToLinalgPattern(RewritePattern):
         dot_ops[-1].attributes["arrax.facc"] = StringAttr("persistent")
         all_ops.extend(dot_ops)
 
-        # Step 2: broadcast-mul with rmsnorm attributes
-        mul_ops, mul_result = _emit_broadcast_binary(
-            op.input, dot_result, arith.MulfOp, vec_type,
+        # Step 2: divide by N (rank-0 scalar math)
+        def _divf_body(args: list[SSAValue]) -> tuple[list[Operation], SSAValue]:
+            const = arith.ConstantOp(FloatAttr(float(n), f32))
+            div = arith.DivfOp(args[0], const.result)
+            return [const, div], div.result
+
+        div_ops, div_result = _emit_rank0_unary(
+            dot_result, _divf_body, scalar_type,
         )
-        mul_ops[-1].attributes["arrax.rmsnorm_divisor"] = IntegerAttr(n, i64)
-        mul_ops[-1].attributes["arrax.rmsnorm_eps"] = FloatAttr(1e-5, f32)
+        all_ops.extend(div_ops)
+
+        # Step 3: add eps (rank-0 scalar math)
+        def _addf_body(args: list[SSAValue]) -> tuple[list[Operation], SSAValue]:
+            eps = arith.ConstantOp(FloatAttr(1e-5, f32))
+            add = arith.AddfOp(args[0], eps.result)
+            return [eps, add], add.result
+
+        add_ops, add_result = _emit_rank0_unary(
+            div_result, _addf_body, scalar_type,
+        )
+        all_ops.extend(add_ops)
+
+        # Step 4: rsqrt (rank-0 scalar math)
+        def _rsqrt_body(args: list[SSAValue]) -> tuple[list[Operation], SSAValue]:
+            rsqrt = math.RsqrtOp(args[0])
+            return [rsqrt], rsqrt.result
+
+        rsqrt_ops, scale_result = _emit_rank0_unary(
+            add_result, _rsqrt_body, scalar_type,
+        )
+        all_ops.extend(rsqrt_ops)
+
+        # Step 5: broadcast-mul (x * scale) — plain, no attributes
+        mul_ops, mul_result = _emit_broadcast_binary(
+            op.input, scale_result, arith.MulfOp, vec_type,
+        )
         all_ops.extend(mul_ops)
 
         rewriter.replace_matched_op(all_ops, [mul_result])

@@ -264,7 +264,7 @@ class TileLinalgPattern(RewritePattern):
             iterator_types=op.iterator_types,
             result_types=[],
         )
-        # Preserve discardable attributes (e.g. arrax.mean_divisor).
+        # Preserve discardable attributes (e.g. arrax.facc).
         for name, attr in op.attributes.items():
             if name not in inner_generic.attributes:
                 inner_generic.attributes[name] = attr

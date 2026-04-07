@@ -234,21 +234,24 @@ builtin.module {
         assert '"parallel"' in ir
         assert '"reduction"' in ir
 
-    def test_mean_produces_sum_generic_with_divisor_attr(self) -> None:
-        """mean(A) lowers to a sum-shaped generic with arrax.mean_divisor attribute."""
+    def test_mean_decomposes_to_sum_plus_rank0_divf(self) -> None:
+        """mean(A) lowers to sum reduction + rank-0 divf generic."""
         module = make_module(lambda A: mean(A), {"A": (128,)})
         lower_to_linalg(module)
         ir = str(module)
-        assert "linalg.generic" in ir
+        # Sum reduction generic
         assert '"reduction"' in ir
         assert "arith.addf" in ir
         assert "linalg.fill" in ir
-        # The divisor attribute is attached to the generic
-        assert "arrax.mean_divisor = 128 : i64" in ir
+        # Rank-0 divf generic (0 iterators)
+        assert "iterator_types = []" in ir
+        assert "arith.divf" in ir
+        # The constant 128.0 for dividing
+        assert "1.280000e+02" in ir
 
-    def test_mean_divisor_matches_input_size(self) -> None:
-        """arrax.mean_divisor value matches the input tensor dimension."""
+    def test_mean_divf_constant_matches_input_size(self) -> None:
+        """Rank-0 divf constant matches the input tensor dimension."""
         module = make_module(lambda A: mean(A), {"A": (64,)})
         lower_to_linalg(module)
         ir = str(module)
-        assert "arrax.mean_divisor = 64 : i64" in ir
+        assert "6.400000e+01" in ir  # 64.0

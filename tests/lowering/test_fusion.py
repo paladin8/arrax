@@ -113,7 +113,8 @@ class TestFusion:
         ir = str(module)
         assert ir.count("scf.for") == 1
         assert "iter_args" in ir
-        assert ir.count("linalg.generic") == 3
+        # 4 generics: add, sub, sum reduction + rank-0 divf
+        assert ir.count("linalg.generic") == 4
 
     def test_facc_conflict_dot_scalar_not_fused(self) -> None:
         """dot(A * 2.0, B): scalar-vector uses facc, dot uses facc — skip fusion."""
@@ -315,7 +316,7 @@ class TestFusion:
         """rmsnorm(A) at N=128: dot reduction + broadcast-mul = 2 loops.
 
         Loop 1: dot(x,x) reduction
-        Scalar math: fdiv.s, fadd.s, frsqrt (between loops, not tiled)
+        Rank-0 generics: divf, addf, rsqrt (between loops, not tiled)
         Loop 2: mul by scale (broadcast)
         """
         module = make_module(lambda A: rmsnorm(A), {"A": (128,)})
@@ -323,9 +324,12 @@ class TestFusion:
         module.verify()
         ir = str(module)
         assert ir.count("scf.for") == 2
-        assert ir.count("linalg.generic") == 2
+        # 5 generics: dot + 3 rank-0 scalar math + broadcast-mul
+        assert ir.count("linalg.generic") == 5
         # One loop carries iter_args (dot reduction)
         assert ir.count("iter_args") == 1
+        # Rank-0 generics are visible as 0-iterator generics
+        assert ir.count("iterator_types = []") == 3
 
     def test_rmsnorm_of_relu_fuses_producer(self) -> None:
         """rmsnorm(relu(A)) at N=128: relu fuses into dot loop, still 2 loops."""
@@ -335,5 +339,5 @@ class TestFusion:
         ir = str(module)
         # relu fuses into the dot reduction loop (parallel -> reduction)
         assert ir.count("scf.for") == 2
-        # 3 generics: relu + 2 from rmsnorm
-        assert ir.count("linalg.generic") == 3
+        # 6 generics: relu + dot + 3 rank-0 + broadcast-mul
+        assert ir.count("linalg.generic") == 6

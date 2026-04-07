@@ -143,7 +143,7 @@ class BufferizePass(ModulePass):
                     iterator_types=op.iterator_types,
                     result_types=[],  # memref semantics: no results
                 )
-                # Preserve discardable attributes (e.g. arrax.mean_divisor).
+                # Preserve discardable attributes (e.g. arrax.facc).
                 for name, attr in op.attributes.items():
                     if name not in new_generic.attributes:
                         new_generic.attributes[name] = attr

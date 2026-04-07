@@ -8,15 +8,12 @@ the hardware's in-place semantics (copy + insn when dst != src2).
 from __future__ import annotations
 
 from xdsl.dialects import arith
-from xdsl.dialects.builtin import Float32Type, FloatAttr, IndexType, IntegerAttr, MemRefType
+from xdsl.dialects.builtin import Float32Type, IndexType, IntegerAttr, MemRefType
 from xdsl.ir import Dialect, Operation, SSAValue
 from xdsl.irdl import (
     IRDLOperation,
-    ParsePropInAttrDict,
     irdl_op_definition,
     operand_def,
-    opt_prop_def,
-    prop_def,
     result_def,
 )
 from xdsl.utils.exceptions import VerifyException
@@ -448,10 +445,6 @@ class FVReduceOp(IRDLOperation):
 
     The scalar accumulator is threaded through SSA (not a rank-0 memref) so
     it stays in an FP register across loop iterations.
-
-    An optional `divisor` property encodes mean semantics: when set, the asm
-    emitter emits a trailing `fdiv.s result, result, divisor` after the
-    reduction loop closes.
     """
 
     name = "npu.fvreduce"
@@ -460,10 +453,6 @@ class FVReduceOp(IRDLOperation):
     n = operand_def(IndexType)
     acc_in = operand_def(Float32Type)
     result = result_def(Float32Type)
-
-    divisor = opt_prop_def(IntegerAttr)
-
-    irdl_options = (ParsePropInAttrDict(),)
 
     assembly_format = (
         "$src `,` $n `,` $acc_in attr-dict"
@@ -475,15 +464,10 @@ class FVReduceOp(IRDLOperation):
         src: SSAValue | Operation,
         n: SSAValue | Operation,
         acc_in: SSAValue | Operation,
-        divisor: int | None = None,
     ) -> None:
-        properties: dict[str, object] = {}
-        if divisor is not None:
-            properties["divisor"] = IntegerAttr(divisor, 64)
         super().__init__(
             operands=[src, n, acc_in],
             result_types=[Float32Type()],
-            properties=properties,
         )
 
     def verify_(self) -> None:

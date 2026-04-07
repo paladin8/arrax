@@ -336,6 +336,8 @@ class _AsmEmitter:
             self._emit_scalar_fp_binop(op, "fadd.s")
         elif isinstance(op, memref.AllocaOp):
             self._emit_alloca(op)
+        elif isinstance(op, memref.LoadOp):
+            self._emit_load(op)
         elif isinstance(op, scf.YieldOp):
             self._emit_yield(op)
         elif isinstance(op, Operation):
@@ -398,6 +400,20 @@ class _AsmEmitter:
     def _emit_alloc(self, op: memref.AllocOp) -> None:
         """Emit .comm for heap buffer allocation."""
         self._emit_mem_alloc(op.memref)
+
+    def _emit_load(self, op: memref.LoadOp) -> None:
+        """Emit a rank-0 f32 load: ``flw <dst>, 0(<base>)``.
+
+        Loads a scalar from a rank-0 memref into a pool register.
+        Used for scalar math between reductions and broadcast ops.
+        """
+        if op.indices:
+            raise ValueError(
+                "asm_emitter: only rank-0 memref.load is supported"
+            )
+        base_reg = self._reg(op.memref)
+        result_reg = self._fp_pool.allocate(op.res)
+        self._lines.append(f"    flw {result_reg}, 0({base_reg})")
 
     def _emit_alloca(self, op: memref.AllocaOp) -> None:
         """Emit .comm for stack-allocated buffer (e.g. rank-0 FRSQRT scratch)."""
@@ -499,24 +515,8 @@ class _AsmEmitter:
                 f"    .insn r 0x2B, 0x5, 0x00, {acc_reg}, f0, f0"
             )
 
-        # Mean: if the body has an FVReduceOp with a divisor, emit the
-        # trailing fdiv.s after the loop (division happens once, not per tile).
-        for bop in body.ops:
-            if isinstance(bop, FVReduceOp) and bop.divisor is not None:
-                acc_reg = self._fp_pool.get(op.results[0])
-                self._emit_mean_divide(acc_reg, bop.divisor.value.data)
-                break
-
         # Restore s-reg counter for sequential loop reuse
         self._s_reg_count = loop_s_reg_start
-
-    def _emit_mean_divide(self, acc_reg: str, divisor: int) -> None:
-        """Emit ``fdiv.s acc, acc, ft1`` for mean post-reduction divide."""
-        div_bits = struct.unpack("<I", struct.pack("<f", float(divisor)))[0]
-        self._lines.append(f"    # Mean: divide by {divisor}")
-        self._lines.append(f"    li t0, {div_bits}")
-        self._lines.append(f"    fmv.w.x ft1, t0")
-        self._lines.append(f"    fdiv.s {acc_reg}, {acc_reg}, ft1")
 
     def _materialize_f32_into(self, val: SSAValue, fp_reg: str) -> None:
         """Load the f32 value ``val`` into ``fp_reg`` (callee-saved or scratch).
@@ -622,12 +622,6 @@ class _AsmEmitter:
         )
         # Combine the per-call partial into the running accumulator.
         self._lines.append(f"    fadd.s {acc_reg}, {acc_reg}, ft0")
-
-        # Mean: trailing fdiv.s when not inside a tiled loop (untiled path).
-        # The tiled path defers the division to _emit_for after the loop.
-        in_loop = isinstance(op.parent_op(), scf.ForOp)
-        if op.divisor is not None and not in_loop:
-            self._emit_mean_divide(acc_reg, op.divisor.value.data)
 
     def _emit_fv_max(self, op: FVMaxOp) -> None:
         """Emit NPU.FVMAX + fmax.s into the pooled accumulator register.

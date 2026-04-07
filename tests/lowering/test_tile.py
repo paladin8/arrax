@@ -259,20 +259,23 @@ class TestTile:
 
     # --- mean reduction tiling ---
 
-    def test_mean_tiled_preserves_divisor_attr(self) -> None:
-        """mean(A), n=128: tiling preserves arrax.mean_divisor on the inner generic."""
+    def test_mean_tiled_has_rank0_divf(self) -> None:
+        """mean(A), n=128: tiled sum loop + rank-0 divf between loops."""
         module = make_module(lambda A: mean(A), {"A": (128,)})
         tile(module)
         ir = str(module)
         assert "scf.for" in ir
-        assert "arrax.mean_divisor = 128 : i64" in ir
+        # Rank-0 divf generic present (not tiled, sits between loops)
+        assert "iterator_types = []" in ir
+        assert "arith.divf" in ir
 
-    def test_mean_untiled_preserves_divisor_attr(self) -> None:
-        """mean(A), n=32: no tiling, divisor attr still present."""
+    def test_mean_untiled_has_rank0_divf(self) -> None:
+        """mean(A), n=32: no tiling, rank-0 divf generic still present."""
         module = make_module(lambda A: mean(A), {"A": (32,)})
         tile(module)
         ir = str(module)
-        assert "arrax.mean_divisor = 32 : i64" in ir
+        assert "iterator_types = []" in ir
+        assert "arith.divf" in ir
 
     def test_mean_tiled_verifies(self) -> None:
         """Tiled mean reduction IR passes xDSL verification."""

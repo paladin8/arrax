@@ -6,7 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from xdsl.context import Context
-from xdsl.dialects import arith, linalg, math, memref, scf
+from xdsl.dialects import arith, linalg, math, memref
 from xdsl.dialects.builtin import (
     DYNAMIC_INDEX,
     Float32Type,
@@ -321,51 +321,6 @@ class LinalgBroadcastBinaryToNpuPattern(RewritePattern):
             extra_ops.append(load_op)
             scalar_val = load_op.res
 
-        # RMSNorm scalar math: if the broadcast-mul has rmsnorm attributes,
-        # apply divf(sumsq, N), addf(meansq, eps), store to scratch, frsqrt
-        # before the final fvmul. The scalar math must be hoisted BEFORE the
-        # containing scf.for (if tiled) so it executes once, not per-tile.
-        if npu_op_type == "mul" and "arrax.rmsnorm_divisor" in op.attributes:
-            f32 = Float32Type()
-            divisor_attr = op.attributes["arrax.rmsnorm_divisor"]
-            eps_attr = op.attributes["arrax.rmsnorm_eps"]
-            n_val = float(divisor_attr.value.data)
-            eps_val = eps_attr.value.data
-
-            # Build the scalar math op sequence. If scalar_val came from
-            # a memref.load fallback (not forwarded), include the load in
-            # the hoisted ops to avoid a dominance violation.
-            hoist_ops: list[Operation] = []
-            if scalar_val.owner in extra_ops:
-                # Move the load from extra_ops into hoist_ops
-                extra_ops.remove(scalar_val.owner)
-                hoist_ops.append(scalar_val.owner)
-
-            n_const = arith.ConstantOp(FloatAttr(n_val, f32))
-            meansq = arith.DivfOp(scalar_val, n_const.result)
-            eps_const = arith.ConstantOp(FloatAttr(eps_val, f32))
-            shifted = arith.AddfOp(meansq.result, eps_const.result)
-            scratch = memref.AllocaOp.get(f32, shape=[])
-            store = memref.StoreOp.get(shifted.result, scratch.memref, [])
-            rsqrt = FRsqrtOp(scratch.memref)
-            hoist_ops.extend([
-                n_const, meansq, eps_const, shifted, scratch, store, rsqrt,
-            ])
-
-            # Hoist scalar math before the containing scf.for (if inside one).
-            parent = op.parent_op()
-            if isinstance(parent, scf.ForOp):
-                parent_block = parent.parent_block()
-                assert parent_block is not None
-                for sop in hoist_ops:
-                    parent_block.insert_op_before(sop, parent)
-            else:
-                extra_ops.extend(hoist_ops)
-
-            npu_op = FVMulOp(vec_operand, outputs[0], n_ssa, rsqrt.result)
-            rewriter.replace_matched_op([*extra_ops, npu_op], [])
-            return
-
         # Emit the appropriate NPU op
         out = outputs[0]
         if npu_op_type == "sub_scalar":
@@ -378,6 +333,72 @@ class LinalgBroadcastBinaryToNpuPattern(RewritePattern):
             return
 
         rewriter.replace_matched_op([*extra_ops, npu_op], [])
+
+
+class LinalgRank0ToScalarPattern(RewritePattern):
+    """Inline rank-0 linalg.generic bodies into scalar ops.
+
+    Rank-0 generics (0 iterators) represent scalar math between reductions
+    and broadcast ops (e.g. rmsnorm's divf, addf, rsqrt). This pattern
+    replaces them with memref.load + body ops + memref.store.
+
+    Special case: math.rsqrt body emits npu.frsqrt (reads from memory
+    directly, returns scalar f32 to a register).
+    """
+
+    @op_type_rewrite_pattern
+    def match_and_rewrite(
+        self, op: linalg.GenericOp, rewriter: PatternRewriter
+    ) -> None:
+        # Match: 0 iterators, 1 input, 1 output, both rank-0 memref
+        if len(op.iterator_types.data) != 0:
+            return
+        inputs = list(op.inputs)
+        outputs = list(op.outputs)
+        if len(inputs) != 1 or len(outputs) != 1:
+            return
+        in_type = inputs[0].type
+        out_type = outputs[0].type
+        if not isinstance(in_type, MemRefType) or len(in_type.get_shape()) != 0:
+            return
+        if not isinstance(out_type, MemRefType) or len(out_type.get_shape()) != 0:
+            return
+
+        body_block = op.body.blocks.first
+        assert body_block is not None
+        body_ops = list(body_block.ops)
+
+        # math.rsqrt body → npu.frsqrt (reads from memory, returns f32)
+        if (
+            len(body_ops) == 2
+            and isinstance(body_ops[0], math.RsqrtOp)
+            and isinstance(body_ops[1], linalg.YieldOp)
+        ):
+            rsqrt = FRsqrtOp(inputs[0])
+            store = memref.StoreOp.get(rsqrt.result, outputs[0], [])
+            rewriter.replace_matched_op([rsqrt, store], [])
+            return
+
+        # arith body with constant: divf(in, const) or addf(in, const)
+        # Body shape: [constant, arith_op, yield]
+        if (
+            len(body_ops) == 3
+            and isinstance(body_ops[0], arith.ConstantOp)
+            and isinstance(body_ops[2], linalg.YieldOp)
+        ):
+            compute = body_ops[1]
+            if not isinstance(compute, (arith.DivfOp, arith.AddfOp)):
+                return
+            const_attr = body_ops[0].value
+            load = memref.LoadOp.get(inputs[0], [])
+            const = arith.ConstantOp(const_attr)
+            if isinstance(compute, arith.DivfOp):
+                result_op = arith.DivfOp(load.res, const.result)
+            else:
+                result_op = arith.AddfOp(load.res, const.result)
+            store = memref.StoreOp.get(result_op.result, outputs[0], [])
+            rewriter.replace_matched_op([load, const, result_op, store], [])
+            return
 
 
 class LinalgReductionToNpuPattern(RewritePattern):
@@ -474,12 +495,6 @@ class LinalgReductionToNpuPattern(RewritePattern):
         # Build the npu reduction op.
         reduction_op = npu_op_builder(n_ssa, acc_in)
 
-        # Propagate mean divisor attribute to FVReduceOp property.
-        if isinstance(reduction_op, FVReduceOp):
-            divisor_attr = op.attributes.get("arrax.mean_divisor")
-            if divisor_attr is not None:
-                reduction_op.properties["divisor"] = divisor_attr
-
         load = _find_following_load(op, out_val)
         if load is not None:
             # Tiled case: reduction_op.result takes the load's place.
@@ -572,6 +587,52 @@ def _find_following_load(
     return None
 
 
+def _forward_rank0_stores(module: ModuleOp) -> None:
+    """Eliminate redundant store→load pairs for rank-0 memrefs.
+
+    After LinalgRank0ToScalarPattern inlines rank-0 generics, consecutive
+    scalar ops create chains like: store %val → load → arith → store → load.
+    Each intermediate store/load pair is a wasteful memory round-trip.
+
+    For each rank-0 memref.alloc, if there is exactly one store and one load,
+    replace the load result with the stored value and erase both the load and
+    (if no remaining uses) the store and alloc.
+    """
+    to_erase: list[Operation] = []
+
+    for op in module.walk():
+        if not isinstance(op, memref.AllocOp):
+            continue
+        alloc_type = op.memref.type
+        if not isinstance(alloc_type, MemRefType):
+            continue
+        if len(alloc_type.get_shape()) != 0:
+            continue
+
+        # Collect all stores and loads to this rank-0 alloc.
+        # Safe at any nesting level: the "exactly 1 store + 1 load"
+        # predicate guarantees the store dominates the load.
+        stores: list[memref.StoreOp] = []
+        loads: list[memref.LoadOp] = []
+        for use in op.memref.uses:
+            if isinstance(use.operation, memref.StoreOp):
+                stores.append(use.operation)
+            elif isinstance(use.operation, memref.LoadOp):
+                loads.append(use.operation)
+
+        if len(stores) != 1 or len(loads) != 1:
+            continue
+
+        store = stores[0]
+        load = loads[0]
+        load.res.replace_all_uses_with(store.value)
+        to_erase.extend([load, store, op])
+
+    for dead in to_erase:
+        dead.detach()
+        dead.erase()
+
+
 @dataclass(frozen=True)
 class LinalgToNpuPass(ModulePass):
     """Lower linalg.generic ops on memrefs to NPU dialect operations."""
@@ -584,7 +645,9 @@ class LinalgToNpuPass(ModulePass):
                 [
                     LinalgElementwiseToNpuPattern(),
                     LinalgBroadcastBinaryToNpuPattern(),
+                    LinalgRank0ToScalarPattern(),
                     LinalgReductionToNpuPattern(),
                 ]
             )
         ).rewrite_module(op)
+        _forward_rank0_stores(op)

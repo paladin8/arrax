@@ -383,19 +383,6 @@ class TestFVReduceOp:
         op = FVReduceOp(src, n_const.result, acc_in)
         op.verify()
 
-    def test_divisor_property_optional(self) -> None:
-        """divisor is optional (None for sum, set for mean)."""
-        memref_type = MemRefType(Float32Type(), [64])
-        src = create_ssa_value(memref_type)
-        n = create_ssa_value(IndexType())
-        acc_in = create_ssa_value(Float32Type())
-
-        op_no_div = FVReduceOp(src, n, acc_in)
-        assert op_no_div.divisor is None
-
-        op_with_div = FVReduceOp(src, n, acc_in, divisor=128)
-        assert op_with_div.divisor is not None
-        assert op_with_div.divisor.value.data == 128
 
     def test_ir_prints_correctly(self) -> None:
         memref_type = MemRefType(Float32Type(), [64])

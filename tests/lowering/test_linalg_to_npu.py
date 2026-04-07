@@ -457,26 +457,19 @@ builtin.module {
     # --- reduction lowering (mean) ---
 
     def test_mean_untiled_basic(self) -> None:
-        """mean(A), n=64: produces npu.fvreduce with divisor property + store."""
+        """mean(A), n=64: fvreduce → divf → store (forwarded, no intermediate load)."""
         module = make_module(lambda A: mean(A), {"A": (64,)})
         _lower_to_npu(module)
         ir = str(module)
         assert "npu.fvreduce" in ir
         assert "linalg.generic" not in ir
-        assert "linalg.fill" not in ir
         assert "memref.store" in ir
-        assert "divisor = 64 : i64" in ir
-
-    def test_mean_untiled_small(self) -> None:
-        """mean(A), n=16: divisor matches input size."""
-        module = make_module(lambda A: mean(A), {"A": (16,)})
-        _lower_to_npu(module)
-        ir = str(module)
-        assert "npu.fvreduce" in ir
-        assert "divisor = 16 : i64" in ir
+        assert "arith.divf" in ir
+        # Store-to-load forwarding eliminates intermediate rank-0 memref
+        assert "memref.load" not in ir
 
     def test_mean_tiled_basic(self) -> None:
-        """mean(A), n=128: fvreduce inside scf.for with divisor property."""
+        """mean(A), n=128: fvreduce in loop, divf after loop (forwarded)."""
         module = make_module(lambda A: mean(A), {"A": (128,)})
         _lower_to_npu_with_tiling(module)
         ir = str(module)
@@ -484,18 +477,7 @@ builtin.module {
         assert "scf.for" in ir
         assert "iter_args" in ir
         assert "linalg.generic" not in ir
-        assert "linalg.fill" not in ir
-        assert "memref.alloca" not in ir
-        assert "divisor = 128 : i64" in ir
-
-    def test_mean_tiled_non_multiple(self) -> None:
-        """mean(A), n=100: remainder handled, divisor preserved."""
-        module = make_module(lambda A: mean(A), {"A": (100,)})
-        _lower_to_npu_with_tiling(module)
-        ir = str(module)
-        assert "npu.fvreduce" in ir
-        assert "scf.for" in ir
-        assert "divisor = 100 : i64" in ir
+        assert "arith.divf" in ir
 
     def test_mean_verifies(self) -> None:
         """Verifier passes for both tiled and untiled mean."""
@@ -503,3 +485,59 @@ builtin.module {
             module = make_module(lambda A: mean(A), {"A": (n,)})
             _lower_to_npu_with_tiling(module)
             module.verify()
+
+
+class TestRank0StoreForwarding:
+    """Tests for _forward_rank0_stores — eliminates redundant store→load pairs."""
+
+    def test_nested_rank0_alloc_forwarded(self) -> None:
+        """A rank-0 alloc inside scf.for with 1 store + 1 load is forwarded."""
+        from xdsl.dialects import arith, memref, scf
+        from xdsl.dialects.builtin import (
+            Float32Type, FloatAttr, IndexType, IntegerAttr, MemRefType, ModuleOp,
+        )
+        from xdsl.dialects.func import FuncOp, ReturnOp
+        from xdsl.ir import Block, Region
+        from arrax.lowering.linalg_to_npu import _forward_rank0_stores
+
+        f32 = Float32Type()
+        index = IndexType()
+        out_type = MemRefType(f32, [])
+
+        func_op = FuncOp("test", ([out_type], []))
+        entry = func_op.body.blocks.first
+        assert entry is not None
+        out = entry.args[0]
+
+        c0 = arith.ConstantOp(IntegerAttr(0, index))
+        c1 = arith.ConstantOp(IntegerAttr(1, index))
+        c1s = arith.ConstantOp(IntegerAttr(1, index))
+
+        body_block = Block(arg_types=[index])
+        scratch = memref.AllocOp.get(f32, shape=[])
+        val = arith.ConstantOp(FloatAttr(42.0, f32))
+        store_scratch = memref.StoreOp.get(val.result, scratch.memref, [])
+        load_scratch = memref.LoadOp.get(scratch.memref, [])
+        store_out = memref.StoreOp.get(load_scratch.res, out, [])
+        yield_op = scf.YieldOp()
+        body_block.add_ops([
+            scratch, val, store_scratch, load_scratch, store_out, yield_op,
+        ])
+
+        for_op = scf.ForOp(
+            c0.result, c1.result, c1s.result, [], Region([body_block]),
+        )
+        ret = ReturnOp()
+        entry.add_ops([c0, c1, c1s, for_op, ret])
+        module = ModuleOp([func_op])
+        module.verify()
+
+        assert "memref.load" in str(module)
+        _forward_rank0_stores(module)
+        module.verify()
+        ir = str(module)
+        # Load eliminated, store to scratch eliminated, alloc eliminated
+        assert "memref.load" not in ir
+        assert "memref.alloc" not in ir
+        # The outer store to %out now uses %val directly
+        assert "memref.store" in ir

@@ -147,8 +147,8 @@ builtin.module {
         assert "arith.mulf" in ir
         assert "arith.addf" in ir
 
-    def test_mean_rank0_output_and_divisor_attr_preserved(self) -> None:
-        """mean(A): same as sum but arrax.mean_divisor attr survives bufferization."""
+    def test_mean_rank0_output_and_divf_generic(self) -> None:
+        """mean(A): sum reduction + rank-0 divf generic survive bufferization."""
         module = make_module(lambda A: mean(A), {"A": (64,)})
         bufferize(module)
         ir = str(module)
@@ -156,7 +156,9 @@ builtin.module {
         assert "func.func @kernel(%0: memref<64xf32>, %1: memref<f32>)" in ir
         assert "linalg.fill" in ir
         assert '"reduction"' in ir
-        assert "arrax.mean_divisor = 64 : i64" in ir
+        # Rank-0 divf generic present after bufferize
+        assert "iterator_types = []" in ir
+        assert "arith.divf" in ir
 
     def test_sum_of_add_has_intermediate_alloc(self) -> None:
         """sum(A + B) needs a rank-1 alloc for the add and a rank-0 out arg."""
