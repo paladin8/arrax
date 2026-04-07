@@ -68,11 +68,7 @@ def exp(x: Array) -> Array:
 
 
 def sum(x: Array) -> Array:
-    """Sum-reduction across all elements. Returns a rank-0 Array.
-
-    Reductions must be the compiled function's return value (terminal).
-    A non-terminal use raises at compile time.
-    """
+    """Sum-reduction across all elements. Returns a rank-0 Array."""
     result = Array(name="", shape=())
     result.op = "sum"
     result.operands = [x]
@@ -83,8 +79,6 @@ def dot(a: Array, b: Array) -> Array:
     """Dot product of two 1D arrays. Returns a rank-0 Array.
 
     Requires both inputs to be 1D with matching shapes.
-    Reductions must be the compiled function's return value (terminal); a
-    non-terminal use raises at compile time.
     """
     if len(a.shape) != 1 or len(b.shape) != 1:
         raise ValueError(
@@ -104,8 +98,6 @@ def amax(x: Array) -> Array:
     """Max-reduction across all elements. Returns a rank-0 Array.
 
     Named after NumPy's ``amax`` to avoid shadowing Python's ``max`` builtin.
-    Reductions must be the compiled function's return value (terminal); a
-    non-terminal use raises at compile time.
     """
     result = Array(name="", shape=())
     result.op = "amax"

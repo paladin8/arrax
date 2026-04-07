@@ -148,7 +148,7 @@ linalg.fill(%zero, %sumsq_init)
 
 The attribute-based approach follows the precedent set by `arrax.mean_divisor` in M3: ArrayToLinalg encodes the composite operation's scalar math as discardable attributes on the linalg.generic, and LinalgToNpu reads them to emit the correct sequence. This avoids representing scalar arith ops at the tensor level (arith.divf/addf work on scalars, not tensors) and keeps ArrayToLinalg clean.
 
-The dot(x,x) reduction generic gets `arrax.uses_facc` (same as DotToLinalgPattern). The broadcast-mul generic does NOT get `arrax.uses_facc` — it's a standard mulf with broadcast, not a scalar-vector multiply pattern. This means the fusion pass will not block fusion of the broadcast-mul with adjacent ops.
+The dot(x,x) reduction generic gets `arrax.facc = "persistent"` (same as DotToLinalgPattern). The broadcast-mul generic does NOT get an `arrax.facc` tag — it's a standard mulf with broadcast, not a scalar-vector multiply pattern. This means the fusion pass will not block fusion of the broadcast-mul with adjacent ops.
 
 ### Tiling + fusion behavior
 
@@ -637,10 +637,10 @@ The max-subtraction step prevents overflow in exp(). If the max is not correctly
 
 1. **RED**: Write IR structure test that creates array.rmsnorm, runs ArrayToLinalgPass, and verifies:
    - 1 linalg.fill (zero for dot accumulator)
-   - 1 reduction generic with `arrax.uses_facc` (dot body: mulf + addf)
+   - 1 reduction generic with `arrax.facc = "persistent"` (dot body: mulf + addf)
    - 1 parallel generic with `arrax.rmsnorm_divisor` and `arrax.rmsnorm_eps` attributes (broadcast-mul)
 2. **GREEN**: Implement RMSNormToLinalgPattern:
-   - Step 1: dot(x,x) — same pattern as DotToLinalgPattern but with `ins(%x, %x)` (both inputs are the same tensor). Tag with `arrax.uses_facc`.
+   - Step 1: dot(x,x) — same pattern as DotToLinalgPattern but with `ins(%x, %x)` (both inputs are the same tensor). Tag with `arrax.facc = "persistent"`.
    - Step 2: broadcast-mul with attributes `arrax.rmsnorm_divisor = IntegerAttr(N, i64)` and `arrax.rmsnorm_eps = FloatAttr(1e-5, f32)`. Body: mulf with broadcast map.
    - Register the pattern in `ArrayToLinalgPass.apply()`.
 3. **VERIFY**: IR structure test passes.

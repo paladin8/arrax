@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from arrax.dsl.array import Array, amax, dot, exp, mean, relu, rmsnorm, softmax
 from arrax.dsl.array import sum as arr_sum
-from tests.helpers import fuse, make_module, tile
+from tests.helpers import fuse, make_module, optimize_buffers, tile
 
 
 class TestFusion:
@@ -341,3 +341,24 @@ class TestFusion:
         assert ir.count("scf.for") == 2
         # 6 generics: relu + dot + 3 rank-0 + broadcast-mul
         assert ir.count("linalg.generic") == 6
+
+    # --- buffer optimization ---
+
+    def test_softmax_buffers_shrink(self) -> None:
+        """softmax(A) at N=128: intermediate buffers shrink to tile size."""
+        module = make_module(lambda A: softmax(A), {"A": (128,)})
+        optimize_buffers(module)
+        ir = str(module)
+        # One 64-element buffer (shifted, accessed only within fused loop)
+        assert ir.count("memref.alloc() : memref<64xf32>") == 1
+        # One 128-element buffer (exp, accessed by both fused loop and div loop)
+        assert ir.count("memref.alloc() : memref<128xf32>") == 1
+
+    def test_softmax_of_mul_scalar_fuses(self) -> None:
+        """softmax(A * 2.0): ephemeral facc producer fuses into amax loop."""
+        module = make_module(lambda A: softmax(A * 2.0), {"A": (128,)})
+        fuse(module)
+        module.verify()
+        ir = str(module)
+        # scalar-vec mul fuses into the amax reduction (ephemeral + none → ok)
+        assert ir.count("scf.for") == 3

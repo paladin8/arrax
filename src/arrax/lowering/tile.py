@@ -66,7 +66,7 @@ class TileLinalgPattern(RewritePattern):
 
     Dispatches on iterator_types: all-parallel uses the elementwise path,
     a single 'reduction' iterator uses the scalar-accumulator iter_args
-    path. Mixed iterator kinds are not handled (M3 has no 2D ops).
+    path. Mixed iterator kinds are not handled (no 2D ops yet).
     """
 
     @op_type_rewrite_pattern
@@ -185,7 +185,7 @@ class TileLinalgPattern(RewritePattern):
         accumulator to the original output memref after the loop.
         """
         if len(out_type.get_shape()) != 0:
-            return  # reduction must produce a rank-0 sink in M3
+            return  # reduction must produce a rank-0 sink
         if not isinstance(out_type.element_type, Float32Type):
             return
 

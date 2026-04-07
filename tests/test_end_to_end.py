@@ -1063,3 +1063,41 @@ class TestEndToEnd:
             lambda A: rmsnorm(relu(A)), {"A": (N,)}, {"A": A}, tmp_path
         )
         np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+
+    def test_softmax_large(self, tmp_path: Path) -> None:
+        """softmax(A) with N=512 (many tiles)."""
+        N = 512
+        A = np.random.default_rng(42).standard_normal(N).astype(np.float32)
+        shifted = A - A.max()
+        e = np.exp(shifted)
+        expected = e / e.sum()
+
+        actual, _ = _compile_and_run(
+            lambda A: softmax(A), {"A": (N,)}, {"A": A}, tmp_path
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+
+    def test_rmsnorm_large(self, tmp_path: Path) -> None:
+        """rmsnorm(A) with N=512 (many tiles)."""
+        N = 512
+        A = np.random.default_rng(42).standard_normal(N).astype(np.float32)
+        expected = A / np.sqrt(np.mean(A**2) + 1e-5)
+
+        actual, _ = _compile_and_run(
+            lambda A: rmsnorm(A), {"A": (N,)}, {"A": A}, tmp_path
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+
+    def test_softmax_of_mul_scalar(self, tmp_path: Path) -> None:
+        """softmax(A * 2.0): facc-using producer (ephemeral) before softmax."""
+        N = 128
+        A = np.random.default_rng(42).standard_normal(N).astype(np.float32)
+        x = A * 2.0
+        shifted = x - x.max()
+        e = np.exp(shifted)
+        expected = e / e.sum()
+
+        actual, _ = _compile_and_run(
+            lambda A: softmax(A * 2.0), {"A": (N,)}, {"A": A}, tmp_path
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)

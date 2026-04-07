@@ -281,7 +281,7 @@ def _fuse_block(block: Block) -> bool:
                 break
 
             # Other iter_args combinations (reduction→parallel, reduction→reduction)
-            # are not fused in M3.
+            # are not fused.
     return fused
 
 

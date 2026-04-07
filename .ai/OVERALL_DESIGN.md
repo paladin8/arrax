@@ -90,7 +90,7 @@ array.max      : (tensor<NxF32>) -> f32
 array.dot      : (tensor<NxF32>, tensor<NxF32>) -> f32
 array.matmul   : (tensor<MxKxF32>, tensor<KxNxF32>) -> tensor<MxNxF32>
 array.softmax  : (tensor<NxF32>) -> tensor<NxF32>
-array.rmsnorm  : (tensor<NxF32>, tensor<NxF32>) -> tensor<NxF32>  // (input, gamma)
+array.rmsnorm  : (tensor<NxF32>) -> tensor<NxF32>                 // no gamma in M4; eps=1e-5 hardcoded
 array.splat    : (f32) -> tensor<NxF32>                           // scalar broadcast
 ```
 
@@ -348,7 +348,7 @@ Build pipeline:
 | 5 | `relu(A + B)` | Fused elementwise + activation |
 | 6 | `A @ B` (small matrices) | Tiled matmul |
 | 7 | `softmax(A)` | Multi-instruction composite |
-| 8 | `rmsnorm(A, gamma)` | Multi-instruction composite |
+| 8 | `rmsnorm(A)` | Multi-instruction composite |
 | 9 | Large fused chain, 100K elements | Tiling + fusion |
 
 **Optional x86 comparison**: Compile the same expressions to native x86 via xDSL's standard LLVM path. Compare fused (compiler) vs unfused (NumPy) wall-clock time. Both run natively, so the comparison is fair.
