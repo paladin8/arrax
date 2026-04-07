@@ -339,8 +339,63 @@ class MeanOp(IRDLOperation):
         _verify_rank1_to_rank0_f32(self.name, self.input.type, self.result.type)
 
 
+@irdl_op_definition
+class SoftmaxOp(IRDLOperation):
+    """Softmax: result[i] = exp(input[i] - max(input)) / sum(exp(input - max(input))).
+
+    Takes a rank-1 f32 tensor and produces a rank-1 f32 tensor of the same shape.
+    Decomposed in ArrayToLinalg into amax, sub_broadcast, exp, sum, div_broadcast.
+    """
+
+    name = "array.softmax"
+
+    input = operand_def(TensorType)
+    result = result_def(TensorType)
+
+    assembly_format = "$input attr-dict `:` type($input) `->` type($result)"
+
+    traits = traits_def(Pure())
+
+    def __init__(self, input: SSAValue | Operation) -> None:
+        input_val = SSAValue.get(input)
+        super().__init__(operands=[input], result_types=[input_val.type])
+
+    def verify_(self) -> None:
+        input_type = self.input.type
+        result_type = self.result.type
+        if not isinstance(input_type, TensorType):
+            raise VerifyException(
+                f"array.softmax: input must be a tensor, got {input_type}"
+            )
+        if not isinstance(result_type, TensorType):
+            raise VerifyException(
+                f"array.softmax: result must be a tensor, got {result_type}"
+            )
+        if len(input_type.get_shape()) != 1:
+            raise VerifyException(
+                f"array.softmax: input must be rank-1, got shape {input_type.get_shape()}"
+            )
+        if not isinstance(input_type.element_type, Float32Type):
+            raise VerifyException(
+                f"array.softmax: expected f32 element type, got {input_type.element_type}"
+            )
+        if not isinstance(result_type.element_type, Float32Type):
+            raise VerifyException(
+                f"array.softmax: expected f32 result element type, "
+                f"got {result_type.element_type}"
+            )
+        if input_type.get_shape() != result_type.get_shape():
+            raise VerifyException(
+                f"array.softmax: input and result shapes must match, "
+                f"got {input_type.get_shape()} and {result_type.get_shape()}"
+            )
+
+
 ArrayDialect = Dialect(
     "array",
-    [AddOp, SubOp, ReluOp, ExpOp, MulScalarOp, DivScalarOp, SumOp, AmaxOp, DotOp, MeanOp],
+    [
+        AddOp, SubOp, ReluOp, ExpOp, MulScalarOp, DivScalarOp,
+        SumOp, AmaxOp, DotOp, MeanOp, SoftmaxOp,
+    ],
     [],
 )

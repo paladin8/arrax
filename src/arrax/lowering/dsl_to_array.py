@@ -15,6 +15,7 @@ from arrax.dialects.array_dialect import (
     MeanOp,
     MulScalarOp,
     ReluOp,
+    SoftmaxOp,
     SubOp,
     SumOp,
 )
@@ -131,6 +132,11 @@ def dsl_to_array(
             mean_op = MeanOp(operand)
             entry_block.add_op(mean_op)
             val = mean_op.result
+        elif node.op == "softmax":
+            operand = lower(node.operands[0])
+            softmax_op = SoftmaxOp(operand)
+            entry_block.add_op(softmax_op)
+            val = softmax_op.result
         else:
             raise ValueError(f"unsupported operation: {node.op}")
 

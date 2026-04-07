@@ -40,6 +40,7 @@ from arrax.dialects.npu_dialect import (
     FVReduceOp,
     FVReluOp,
     FVSubOp,
+    FVSubScalarOp,
 )
 
 
@@ -210,6 +211,123 @@ class LinalgElementwiseToNpuPattern(RewritePattern):
             scalar_const = arith.ConstantOp(FloatAttr(scalar_val, Float32Type()))
             npu_op = FVDivOp(inputs[0], outputs[0], n_ssa, scalar_const.result)
             extra_ops.append(scalar_const)
+        else:
+            return
+
+        rewriter.replace_matched_op([*extra_ops, npu_op], [])
+
+
+def _find_dominating_store(scalar_memref: SSAValue) -> SSAValue | None:
+    """Find the SSA value stored to a rank-0 memref.
+
+    Iterates uses of the memref to find a memref.store. If exactly one
+    store exists, returns the stored value (for scalar forwarding).
+
+    Dominance is guaranteed by construction: the tiling pass always emits
+    the reduction's terminal memref.store before any broadcast generic that
+    reads from the same rank-0 memref.
+    """
+    store_val = None
+    for use in scalar_memref.uses:
+        if isinstance(use.operation, memref.StoreOp) and use.operation.memref is scalar_memref:
+            if store_val is not None:
+                return None  # multiple stores — bail
+            store_val = use.operation.value
+    return store_val
+
+
+class LinalgBroadcastBinaryToNpuPattern(RewritePattern):
+    """Match broadcast binary ops (rank-1 + rank-0 inputs) and lower to NPU.
+
+    Recognizes linalg.generic with mixed affine maps: (d0)->(d0) for the
+    vector operand, (d0)->() for the scalar broadcast. The scalar is either
+    forwarded from a dominating memref.store (avoiding a memory round-trip)
+    or loaded via memref.load.
+
+    Body matching:
+    - subf → FVSubScalarOp
+    - divf → FVDivOp (runtime scalar)
+    - mulf → FVMulOp (runtime scalar)
+    """
+
+    @op_type_rewrite_pattern
+    def match_and_rewrite(
+        self, op: linalg.GenericOp, rewriter: PatternRewriter
+    ) -> None:
+        inputs = list(op.inputs)
+        outputs = list(op.outputs)
+        if len(inputs) != 2 or len(outputs) != 1:
+            return
+
+        # Check: 1D parallel, memref operands
+        if len(op.iterator_types.data) != 1:
+            return
+        if op.iterator_types.data[0].data != IteratorType.PARALLEL:
+            return
+
+        # Identify which input is the broadcast scalar (map = (d0) -> ())
+        maps = [m.data for m in op.indexing_maps.data]
+        identity_1d = AffineMap.identity(1)
+        scalar_map = AffineMap.from_callable(lambda d0: ())
+
+        scalar_idx = None
+        for i, m in enumerate(maps[:2]):
+            if m == scalar_map:
+                scalar_idx = i
+        if scalar_idx is None:
+            return
+        vec_idx = 1 - scalar_idx
+
+        # Verify types
+        vec_operand = inputs[vec_idx]
+        scalar_operand = inputs[scalar_idx]
+        if not isinstance(vec_operand.type, MemRefType):
+            return
+        if not isinstance(scalar_operand.type, MemRefType):
+            return
+        if len(scalar_operand.type.get_shape()) != 0:
+            return
+
+        # Match body op
+        body_block = op.body.blocks.first
+        assert body_block is not None
+        body_ops = list(body_block.ops)
+        if len(body_ops) != 2:
+            return
+        if not isinstance(body_ops[1], linalg.YieldOp):
+            return
+        compute = body_ops[0]
+        if isinstance(compute, arith.SubfOp):
+            npu_op_type = "sub_scalar"
+        elif isinstance(compute, arith.DivfOp):
+            npu_op_type = "div"
+        elif isinstance(compute, arith.MulfOp):
+            npu_op_type = "mul"
+        else:
+            return
+
+        # Extract n from the vector operand
+        result = _extract_n(vec_operand, rewriter)
+        if result is None:
+            return
+        extra_ops, n_ssa = result
+
+        # Scalar forwarding: try to use the SSA value directly
+        scalar_val = _find_dominating_store(scalar_operand)
+        if scalar_val is None:
+            # Fallback: emit memref.load
+            load_op = memref.LoadOp.get(scalar_operand, [])
+            extra_ops.append(load_op)
+            scalar_val = load_op.res
+
+        # Emit the appropriate NPU op
+        out = outputs[0]
+        if npu_op_type == "sub_scalar":
+            npu_op = FVSubScalarOp(vec_operand, out, n_ssa, scalar_val)
+        elif npu_op_type == "div":
+            npu_op = FVDivOp(vec_operand, out, n_ssa, scalar_val)
+        elif npu_op_type == "mul":
+            npu_op = FVMulOp(vec_operand, out, n_ssa, scalar_val)
         else:
             return
 
@@ -417,6 +535,10 @@ class LinalgToNpuPass(ModulePass):
     def apply(self, ctx: Context, op: ModuleOp) -> None:
         PatternRewriteWalker(
             GreedyRewritePatternApplier(
-                [LinalgElementwiseToNpuPattern(), LinalgReductionToNpuPattern()]
+                [
+                    LinalgElementwiseToNpuPattern(),
+                    LinalgBroadcastBinaryToNpuPattern(),
+                    LinalgReductionToNpuPattern(),
+                ]
             )
         ).rewrite_module(op)

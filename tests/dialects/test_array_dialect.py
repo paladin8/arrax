@@ -18,6 +18,7 @@ from arrax.dialects.array_dialect import (
     MeanOp,
     MulScalarOp,
     ReluOp,
+    SoftmaxOp,
     SubOp,
     SumOp,
 )
@@ -497,3 +498,37 @@ class TestMeanOp:
         assert "array.mean" in ir
         assert "tensor<128xf32>" in ir
         assert "tensor<f32>" in ir
+
+
+class TestSoftmaxOp:
+    def test_construction(self) -> None:
+        tensor_type = TensorType(Float32Type(), [128])
+        input_val = create_ssa_value(tensor_type)
+        op = SoftmaxOp(input_val)
+        assert op.input == input_val
+        assert op.result.type == tensor_type
+
+    def test_verify(self) -> None:
+        tensor_type = TensorType(Float32Type(), [128])
+        input_val = create_ssa_value(tensor_type)
+        op = SoftmaxOp(input_val)
+        op.verify()
+
+    def test_verify_rank0_fails(self) -> None:
+        """Softmax requires rank-1 input."""
+        input_val = create_ssa_value(TensorType(Float32Type(), []))
+        op = SoftmaxOp(input_val)
+        with pytest.raises(VerifyException, match="rank-1"):
+            op.verify()
+
+    def test_dialect_contains_softmax(self) -> None:
+        assert SoftmaxOp in ArrayDialect._operations
+
+    def test_ir_prints_correctly(self) -> None:
+        tensor_type = TensorType(Float32Type(), [128])
+        input_val = create_ssa_value(tensor_type)
+        op = SoftmaxOp(input_val)
+        module = ModuleOp([input_val.owner, op])
+        ir = str(module)
+        assert "array.softmax" in ir
+        assert "tensor<128xf32>" in ir

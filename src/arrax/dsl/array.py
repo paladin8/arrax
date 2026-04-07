@@ -117,10 +117,21 @@ def mean(x: Array) -> Array:
     """Mean-reduction across all elements. Returns a rank-0 Array.
 
     Equivalent to ``sum(x) / len(x)`` but compiled as a single reduction with
-    a trailing divide. Reductions must be the compiled function's return value
-    (terminal); a non-terminal use raises at compile time.
+    a trailing divide.
     """
     result = Array(name="", shape=())
     result.op = "mean"
+    result.operands = [x]
+    return result
+
+
+def softmax(x: Array) -> Array:
+    """Softmax: exp(x - max(x)) / sum(exp(x - max(x))). Returns same shape.
+
+    Decomposed in the compiler into amax, broadcast-sub, exp, sum, broadcast-div.
+    Numerically stable via max-subtraction before exp.
+    """
+    result = Array(name="", shape=x.shape)
+    result.op = "softmax"
     result.operands = [x]
     return result

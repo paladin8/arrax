@@ -8,7 +8,7 @@ import numpy as np
 from riscv_npu import Emulator
 
 from arrax.codegen.build import build_elf
-from arrax.dsl.array import Array, amax, dot, exp, mean, relu
+from arrax.dsl.array import Array, amax, dot, exp, mean, relu, softmax
 from arrax.dsl.array import sum as arr_sum
 from arrax.pipeline import compile_to_asm
 
@@ -911,3 +911,86 @@ class TestEndToEnd:
             tmp_path,
         )
         assert cycles > 0
+
+    # --- softmax ---
+
+    def test_softmax_basic(self, tmp_path: Path) -> None:
+        """softmax(A) with N=128 (tiled)."""
+        N = 128
+        A = np.random.default_rng(42).standard_normal(N).astype(np.float32)
+        shifted = A - A.max()
+        e = np.exp(shifted)
+        expected = e / e.sum()
+
+        actual, _ = _compile_and_run(
+            lambda A: softmax(A), {"A": (N,)}, {"A": A}, tmp_path
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+
+    def test_softmax_small(self, tmp_path: Path) -> None:
+        """softmax(A) with N=32 (untiled)."""
+        N = 32
+        A = np.random.default_rng(7).standard_normal(N).astype(np.float32)
+        shifted = A - A.max()
+        e = np.exp(shifted)
+        expected = e / e.sum()
+
+        actual, _ = _compile_and_run(
+            lambda A: softmax(A), {"A": (N,)}, {"A": A}, tmp_path
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+
+    def test_softmax_exact_tile(self, tmp_path: Path) -> None:
+        """softmax(A) with N=64 (exactly at tile boundary)."""
+        N = 64
+        A = np.random.default_rng(13).standard_normal(N).astype(np.float32)
+        shifted = A - A.max()
+        e = np.exp(shifted)
+        expected = e / e.sum()
+
+        actual, _ = _compile_and_run(
+            lambda A: softmax(A), {"A": (N,)}, {"A": A}, tmp_path
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+
+    def test_softmax_non_multiple(self, tmp_path: Path) -> None:
+        """softmax(A) with N=135 (non-multiple of 64)."""
+        N = 135
+        A = np.random.default_rng(99).standard_normal(N).astype(np.float32)
+        shifted = A - A.max()
+        e = np.exp(shifted)
+        expected = e / e.sum()
+
+        actual, _ = _compile_and_run(
+            lambda A: softmax(A), {"A": (N,)}, {"A": A}, tmp_path
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+
+    def test_softmax_uniform(self, tmp_path: Path) -> None:
+        """softmax of identical values should produce uniform 1/N."""
+        N = 128
+        A = np.full(N, 5.0, dtype=np.float32)
+        expected = np.full(N, 1.0 / N, dtype=np.float32)
+
+        actual, _ = _compile_and_run(
+            lambda A: softmax(A), {"A": (N,)}, {"A": A}, tmp_path
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+
+    def test_softmax_of_add(self, tmp_path: Path) -> None:
+        """softmax(A + B): elementwise producer fused before softmax."""
+        N = 128
+        A = np.random.default_rng(42).standard_normal(N).astype(np.float32)
+        B = np.random.default_rng(43).standard_normal(N).astype(np.float32)
+        x = A + B
+        shifted = x - x.max()
+        e = np.exp(shifted)
+        expected = e / e.sum()
+
+        actual, _ = _compile_and_run(
+            lambda A, B: softmax(A + B),
+            {"A": (N,), "B": (N,)},
+            {"A": A, "B": B},
+            tmp_path,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
