@@ -84,35 +84,32 @@ All FP NPU instructions use R-type encoding with opcode `0x2B`. Vector ops use f
 
 ### LLVM intrinsic signatures
 
-Binary vector ops (FVADD, FVSUB — two source arrays):
-```
-declare void @llvm.riscv.npu.fvadd(ptr %src1, ptr %src2, ptr %dst, i32 %n)
-declare void @llvm.riscv.npu.fvsub(ptr %src1, ptr %src2, ptr %dst, i32 %n)
-```
+Each intrinsic maps 1:1 to a hardware instruction. The NpuToLlvm pass (Phase 2) handles all higher-level translation (copy loops for in-place ops, facc load sequences for scalar-vector ops, scratch buffer management for reductions).
 
-Unary vector ops (FVRELU, FVEXP, FVGELU — one source array):
+All vector ops share the signature `(ptr, ptr, i32) -> void`, mapping to `(rs1, rs2, rd)` in the instruction encoding:
 ```
-declare void @llvm.riscv.npu.fvrelu(ptr %src, ptr %dst, i32 %n)
+; Binary in-place: dst[i] = src1[i] op dst[i]
+declare void @llvm.riscv.npu.fvadd(ptr %src1, ptr %src2_dst, i32 %n)
+declare void @llvm.riscv.npu.fvsub(ptr %src1, ptr %src2_dst, i32 %n)
+
+; Unary: dst[i] = f(src[i])
 declare void @llvm.riscv.npu.fvexp(ptr %src, ptr %dst, i32 %n)
+declare void @llvm.riscv.npu.fvrelu(ptr %src, ptr %dst, i32 %n)
 declare void @llvm.riscv.npu.fvgelu(ptr %src, ptr %dst, i32 %n)
-```
 
-Scalar-vector ops (FVMUL, FVDIV, FVSUB_SCALAR — facc is loaded before the instruction, modeled as an explicit float operand in the intrinsic):
-```
-declare void @llvm.riscv.npu.fvmul(ptr %src, ptr %dst, i32 %n, float %scalar)
-declare void @llvm.riscv.npu.fvdiv(ptr %src, ptr %dst, i32 %n, float %scalar)
-declare void @llvm.riscv.npu.fvsub_scalar(ptr %src, ptr %dst, i32 %n, float %scalar)
-```
+; Scalar-vector: dst[i] = f(src[i], facc)  — facc loaded separately
+declare void @llvm.riscv.npu.fvmul(ptr %src, ptr %dst, i32 %n)
+declare void @llvm.riscv.npu.fvdiv(ptr %src, ptr %dst, i32 %n)
+declare void @llvm.riscv.npu.fvsub_scalar(ptr %src, ptr %dst, i32 %n)
 
-Reduction vector ops (FVREDUCE, FVMAX — chunk reduction into a scratch destination, caller reads result back):
-```
-declare void @llvm.riscv.npu.fvreduce(ptr %src, ptr %dst, i32 %n)
-declare void @llvm.riscv.npu.fvmax(ptr %src, ptr %dst, i32 %n)
-```
-
-Dot product (FVMAC — accumulates into facc across calls):
-```
+; Dot product: facc += dot(lhs[0..n], rhs[0..n])
 declare void @llvm.riscv.npu.fvmac(ptr %lhs, ptr %rhs, i32 %n)
+```
+
+Reductions return `float` (FPR result in rd):
+```
+declare float @llvm.riscv.npu.fvreduce(ptr %src, i32 %n)
+declare float @llvm.riscv.npu.fvmax(ptr %src, i32 %n)
 ```
 
 Scalar FP ops:
@@ -124,26 +121,30 @@ declare float @llvm.riscv.npu.frelu(float %x)
 declare float @llvm.riscv.npu.fgelu(float %x)
 ```
 
-All vector intrinsics have memory side effects (read src, write dst). FMACC and FVMAC write implicit facc state. FRSTACC reads and clears facc. The NpuToLlvm pass handles the translation from xDSL's SSA-threaded reduction model (where acc_in/result are explicit f32 operands) to the hardware's memory-to-memory model (scratch buffers, facc state).
+All instruction selection patterns are trivial 1:1 `Pat<>` records — no custom `ISelLowering` needed.
 
 ### Patch structure
 
 ```
 llvm-npu/
-  README.md                              — clone LLVM, apply patch, cmake, build
-  patches/
-    0001-add-xnpu-extension.patch        — single patch against LLVM main
+  README.md                  — LLVM clone + build instructions
+  RISCVInstrInfoXnpu.td      — new file → lib/Target/RISCV/
+  IntrinsicsRISCVXnpu.td     — new file → include/llvm/IR/
+  tests/
+    test_vector_ops.ll        — FileCheck tests for vector instructions
+    test_reductions.ll        — FileCheck tests for reductions
+    test_scalar_ops.ll        — FileCheck tests for scalar FP ops
+    run_tests.sh              — standalone test runner (grep-based)
 ```
 
-Files touched by the patch (all within `llvm/`):
+Files to modify in the LLVM tree (one-line additions each):
 
 | File                                           | Change                                    |
 |------------------------------------------------|-------------------------------------------|
-| `lib/Target/RISCV/RISCVFeatures.td`           | `HasVendorXnpu` feature + extension       |
-| `lib/Target/RISCV/RISCVInstrInfoXnpu.td` (new)| 16 FP instruction defs, R-type encoding   |
+| `lib/Target/RISCV/RISCVFeatures.td`           | `HasVendorXnpu` feature + predicate       |
 | `lib/Target/RISCV/RISCVInstrInfo.td`           | `include "RISCVInstrInfoXnpu.td"`         |
-| `include/llvm/IR/IntrinsicsRISCV.td`           | 16 `@llvm.riscv.npu.*` intrinsic decls    |
-| `lib/Target/RISCV/RISCVISelLowering.cpp`       | Intrinsic → custom node lowering          |
+| `include/llvm/IR/IntrinsicsRISCV.td`           | `include "IntrinsicsRISCVXnpu.td"`        |
+| `lib/Target/RISCV/RISCVSubtarget.h`           | `HasVendorXnpu` member + accessor         |
 
 ## xDSL lowering passes
 
