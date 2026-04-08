@@ -23,7 +23,7 @@ trace -> dsl_to_array -> ArrayToLinalg -> Bufferize -> Tile -> Fuse -> BufferOpt
 - facc read-write lock model: arrax.facc StringAttr ("ephemeral" / "persistent") on linalg.generic; fusion blocked when persistent + non-none
 - FVMulOp/FVDivOp: scalar is SSA f32 operand (not FloatAttr property); unifies compile-time and runtime scalars
 - Rank-0 linalg.generic (0 iterators): used for scalar math between reductions and broadcast ops
-- LinalgRank0ToScalarPattern: inlines rank-0 generic bodies (divf/addf → load+arith+store; rsqrt → frsqrt)
+- LinalgRank0ToScalarPattern: inlines rank-0 generic bodies (divf/addf → load+arith+store; rsqrt → load+frsqrt+store)
 - _forward_rank0_stores: eliminates store→load pairs for rank-0 memrefs (walks full module)
 - Mean: sum reduction + rank-0 divf generic (no attributes)
 - Softmax: amax + broadcast-sub + exp + sum + broadcast-div (5 linalg generics, 3 loops when tiled)

@@ -368,15 +368,16 @@ class LinalgRank0ToScalarPattern(RewritePattern):
         assert body_block is not None
         body_ops = list(body_block.ops)
 
-        # math.rsqrt body → npu.frsqrt (reads from memory, returns f32)
+        # math.rsqrt body → load + npu.frsqrt (register-to-register)
         if (
             len(body_ops) == 2
             and isinstance(body_ops[0], math.RsqrtOp)
             and isinstance(body_ops[1], linalg.YieldOp)
         ):
-            rsqrt = FRsqrtOp(inputs[0])
+            load = memref.LoadOp.get(inputs[0], [])
+            rsqrt = FRsqrtOp(load.res)
             store = memref.StoreOp.get(rsqrt.result, outputs[0], [])
-            rewriter.replace_matched_op([rsqrt, store], [])
+            rewriter.replace_matched_op([load, rsqrt, store], [])
             return
 
         # arith body with constant: divf(in, const) or addf(in, const)

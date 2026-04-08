@@ -1,12 +1,13 @@
 """Toolchain invocation: assemble and link kernel into ELF firmware.
 
 Wraps the kernel assembly with a main function and data declarations,
-then invokes riscv64-unknown-elf-gcc to produce an ELF binary.
+then invokes the RISC-V cross-compiler to produce an ELF binary.
 """
 
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -17,6 +18,25 @@ RISCV_NPU_DIR = Path(
     os.environ.get("RISCV_NPU_DIR", Path(__file__).parents[4] / "riscv-npu")
 )
 COMMON_DIR = RISCV_NPU_DIR / "firmware" / "common"
+
+
+_KNOWN_GCC_NAMES = ("riscv64-unknown-elf-gcc", "riscv64-elf-gcc")
+
+
+def _find_cross_gcc() -> str:
+    """Auto-detect RISC-V cross-compiler.
+
+    Tries riscv64-unknown-elf-gcc first, then riscv64-elf-gcc.
+    Returns the resolved absolute path from shutil.which().
+    """
+    for name in _KNOWN_GCC_NAMES:
+        path = shutil.which(name)
+        if path is not None:
+            return path
+    raise FileNotFoundError(
+        "No RISC-V cross-compiler found. "
+        "Install riscv64-unknown-elf-gcc or riscv64-elf-gcc."
+    )
 
 
 def build_elf(
@@ -98,6 +118,15 @@ def _generate_firmware_asm(
     return "\n".join(lines) + "\n"
 
 
+def _run_cross_gcc(args: list[str]) -> subprocess.CompletedProcess[str]:
+    """Run the RISC-V cross-compiler with the given arguments.
+
+    Uses list form (no shell=True) to prevent command injection.
+    The executable is resolved from a fixed allowlist via _find_cross_gcc().
+    """
+    return subprocess.run(args, capture_output=True, text=True)
+
+
 def _assemble_and_link(full_asm: str, output_dir: Path | None = None) -> Path:
     """Assemble and link the .S file into an ELF binary."""
     if output_dir is None:
@@ -115,25 +144,21 @@ def _assemble_and_link(full_asm: str, output_dir: Path | None = None) -> Path:
     if not linker_ld.exists():
         raise FileNotFoundError(f"riscv-npu linker.ld not found at {linker_ld}")
 
-    result = subprocess.run(
-        [
-            "riscv64-unknown-elf-gcc",
-            "-march=rv32imf",
-            "-mabi=ilp32f",
-            "-nostdlib",
-            "-ffreestanding",
-            f"-T{linker_ld}",
-            "-o",
-            str(elf_path),
-            str(asm_path),
-            str(start_o),
-        ],
-        capture_output=True,
-        text=True,
-    )
+    gcc = _find_cross_gcc()
+
+    result = _run_cross_gcc([
+        gcc,
+        "-march=rv32imf",
+        "-mabi=ilp32f",
+        "-nostdlib",
+        "-ffreestanding",
+        f"-T{linker_ld}",
+        "-o",
+        str(elf_path),
+        str(asm_path),
+        str(start_o),
+    ])
     if result.returncode != 0:
-        raise RuntimeError(
-            f"riscv64-unknown-elf-gcc failed:\n{result.stderr}"
-        )
+        raise RuntimeError(f"{gcc} failed:\n{result.stderr}")
 
     return elf_path

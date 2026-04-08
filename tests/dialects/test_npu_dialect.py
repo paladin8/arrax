@@ -804,37 +804,23 @@ class TestFVSubScalarOp:
 
 class TestFRsqrtOp:
     def test_construction(self) -> None:
-        src = create_ssa_value(MemRefType(Float32Type(), []))
+        src = create_ssa_value(Float32Type())
 
         op = FRsqrtOp(src)
         assert op.src == src
         assert op.result.type == Float32Type()
 
     def test_verify(self) -> None:
-        src = create_ssa_value(MemRefType(Float32Type(), []))
+        src = create_ssa_value(Float32Type())
 
         op = FRsqrtOp(src)
         op.verify()
-
-    def test_verify_non_rank0_fails(self) -> None:
-        src = create_ssa_value(MemRefType(Float32Type(), [64]))
-
-        op = FRsqrtOp(src)
-        with pytest.raises(VerifyException, match="rank-0"):
-            op.verify()
-
-    def test_verify_wrong_element_type_fails(self) -> None:
-        src = create_ssa_value(MemRefType(Float64Type(), []))
-
-        op = FRsqrtOp(src)
-        with pytest.raises(VerifyException, match="f32 element type"):
-            op.verify()
 
     def test_dialect_contains_op(self) -> None:
         assert FRsqrtOp in NPUDialect._operations
 
     def test_ir_prints_correctly(self) -> None:
-        src = create_ssa_value(MemRefType(Float32Type(), []))
+        src = create_ssa_value(Float32Type())
 
         op = FRsqrtOp(src)
         module = ModuleOp([src.owner, op])

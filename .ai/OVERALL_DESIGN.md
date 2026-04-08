@@ -222,7 +222,7 @@ npu.fvmax        %src, %n             : (memref, index) -> f32_reg
 // Scalar
 npu.frelu        %src                 : (f32_reg) -> f32_reg
 npu.fgelu        %src                 : (f32_reg) -> f32_reg
-npu.frsqrt      %addr                : (memref) -> f32_reg
+npu.frsqrt       %src                 : (f32_reg) -> f32_reg
 ```
 
 Operations use memref operands for arrays and f32 register operands for scalars. The NPU's `fvmul_scale`, `fvdiv_scale`, and `fvsub_scalar` operations implicitly read the scalar from the FP accumulator.
@@ -274,7 +274,7 @@ npu.fvdiv_scale %exp_buf, %dst, %n
 npu.fvmac %x, %x, %n                      // facc = sum(x²)
 npu.frstacc → %sum_sq
 // scalar: mean_sq = sum_sq / N + eps (FDIV.S, FADD.S)
-npu.frsqrt %mean_sq_addr → %scale
+npu.frsqrt %mean_sq → %scale
 // store scale to facc via FMACC
 npu.fvmul_scale %x, %tmp, %n              // tmp = x * scale
 // gamma multiplication: element-by-element (scalar loop or staged FVMUL)
@@ -618,14 +618,7 @@ arrax/
 2. RMSNorm end-to-end
 3. Verification against NumPy/PyTorch reference
 
-### Milestone 5: Tiling (Week 3-4)
-
-1. Tiling pass with configurable memory budget
-2. Large array tests (100K+ elements)
-3. Correctness verification: tiled == untiled
-4. Instruction count comparison: tiled vs untiled
-
-### Milestone 6: LLVM backend (Week 5-7)
+### Milestone 5: LLVM backend (Week 5-7)
 
 1. Build LLVM from source with RISC-V target
 2. TableGen NPU instruction definitions

@@ -401,16 +401,16 @@ class FVSubScalarOp(IRDLOperation):
 
 @irdl_op_definition
 class FRsqrtOp(IRDLOperation):
-    """Reciprocal square root: result = 1/sqrt(mem[src]).
+    """Reciprocal square root: result = 1/sqrt(src).
 
     Maps to NPU.FRSQRT (opcode=0x2B, funct7=0x03).
-    Reads one f32 from memory at src address, returns 1/sqrt(value) as
-    scalar f32. This is a scalar instruction (no element count).
+    Takes an f32 scalar in an FP register, returns 1/sqrt(value) as
+    scalar f32. This is a scalar register-to-register instruction.
     """
 
     name = "npu.frsqrt"
 
-    src = operand_def(MemRefType)
+    src = operand_def(Float32Type)
     result = result_def(Float32Type)
 
     assembly_format = "$src attr-dict `:` type($src)"
@@ -420,20 +420,6 @@ class FRsqrtOp(IRDLOperation):
             operands=[src],
             result_types=[Float32Type()],
         )
-
-    def verify_(self) -> None:
-        src_type = self.src.type
-        assert isinstance(src_type, MemRefType)
-        if len(src_type.get_shape()) != 0:
-            raise VerifyException(
-                f"npu.frsqrt: expected rank-0 memref, "
-                f"got {src_type}"
-            )
-        if not isinstance(src_type.element_type, Float32Type):
-            raise VerifyException(
-                f"npu.frsqrt: expected f32 element type, "
-                f"got {src_type.element_type}"
-            )
 
 
 @irdl_op_definition

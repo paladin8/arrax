@@ -136,7 +136,7 @@ linalg.fill(%zero, %sumsq_init)
 // Steps 2-4: multiply by scale (broadcast)
 // The scalar math (sumsq/N + eps, rsqrt) is encoded as attributes on the broadcast-mul
 // generic. LinalgToNpu reads these attributes and emits the scalar math sequence
-// (fdiv.s, fadd.s, store-to-scratch, FRSQRT) between loading the reduction result
+// (fdiv.s, fadd.s, FRSQRT) between loading the reduction result
 // and executing the FVMUL.
 %out = linalg.generic {
     indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> ()>, affine_map<(d0) -> (d0)>],
@@ -290,12 +290,12 @@ Reciprocal square root. Hardware instruction: FRSQRT (funct7=0x03).
 @irdl_op_definition
 class FRsqrtOp(IRDLOperation):
     name = "npu.frsqrt"
-    src = operand_def(MemRefType)          # rank-0 memref (single float address)
+    src = operand_def(Float32Type)         # f32 scalar in FP register
     result = result_def(Float32Type)       # scalar result: 1/sqrt(src)
     traits = frozenset()
 ```
 
-Semantics: reads one f32 from memory at src address, returns 1/sqrt(value) as scalar f32. This is a scalar instruction despite the `fv` prefix — it operates on a single memory location.
+Semantics: takes an f32 scalar from an FP register, returns 1/sqrt(value) as scalar f32 in an FP register. This is a scalar register-to-register instruction.
 
 ### FVMulOp/FVDivOp refactor: property → SSA operand
 
@@ -351,9 +351,8 @@ When LinalgToNpu encounters a broadcast-mul generic with `arrax.rmsnorm_divisor`
 1. Load the dot result from rank-0 memref (scalar forwarding if possible)
 2. Emit `arith.DivfOp(%sumsq, N_const)` → `%meansq` (becomes fdiv.s at asm time)
 3. Emit `arith.AddfOp(%meansq, eps_const)` → `%shifted` (becomes fadd.s at asm time)
-4. Store `%shifted` to a `memref.alloca<f32>` scratch (FRSQRT reads from memory)
-5. Emit `npu.FRsqrtOp(%scratch)` → `%scale`
-6. Emit `npu.FVMulOp(%src, %dst, %n, %scale)` (runtime scalar)
+4. Emit `npu.FRsqrtOp(%shifted)` → `%scale` (register-to-register)
+5. Emit `npu.FVMulOp(%src, %dst, %n, %scale)` (runtime scalar)
 
 This follows the `arrax.mean_divisor` precedent: attributes encode the composite operation's inter-step scalar math, LinalgToNpu emits the actual instructions.
 
@@ -377,11 +376,11 @@ The scalar register (fs?) is looked up from the register pool.
 ### FRsqrtOp
 
 ```asm
-    # addr already in a general-purpose register (from rank-0 memref base pointer)
-    .insn r 0x2B, 0x0, 0x03, fd, rs1, x0    # FRSQRT: f[rd] = 1/sqrt(mem[rs1])
+    # src already in an FP register (from scalar math chain)
+    .insn r 0x2B, 0x0, 0x03, fd, fs, f0     # FRSQRT: f[rd] = 1/sqrt(f[rs1])
 ```
 
-Result goes to a float register managed by the pool.
+Both source and result are FP registers managed by the pool.
 
 ### Scalar arith ops
 
@@ -451,8 +450,8 @@ The `(d0) -> ()` broadcast map on a linalg.generic input is standard MLIR but ma
 **Risk: FVMulOp/FVDivOp refactor breaks existing tests.**
 Changing from property to SSA operand touches working code. Mitigation: Phase 2 refactors the ops and immediately runs the full test suite to verify no regressions. The change is mechanical — every call site just wraps the float value in an arith.ConstantOp.
 
-**Risk: FRSQRT memory operand after scalar forwarding.**
-FRSQRT reads from a memory address. After scalar forwarding, the value is SSA f32 (no memref). Mitigation: LinalgToNpu emits `memref.alloca + memref.store` to put the value in memory before FRSQRT. One extra store, acceptable overhead for one instruction.
+**Risk: FRSQRT operand type.**
+FRSQRT takes an f32 FP register. The scalar forwarding pass naturally provides SSA f32 values, so no scratch alloca is needed. The store→load forwarding pass (`_forward_rank0_stores`) eliminates any intermediate rank-0 memrefs in the scalar math chain.
 
 **Risk: softmax numerical stability for large values.**
 The max-subtraction step prevents overflow in exp(). If the max is not correctly computed (e.g., due to a tiling bug), exp() produces inf. Mitigation: E2E tests include large-value inputs where stability matters.
@@ -535,8 +534,8 @@ The max-subtraction step prevents overflow in exp(). If the max is not correctly
 
 1. **RED**: Write unit test for FRsqrtOp creation/verify. Write asm emission test checking `.insn r 0x2B, 0x0, 0x03`.
 2. **GREEN**:
-   - `npu_dialect.py`: Add FRsqrtOp with operands: src (MemRefType, rank-0), result (Float32Type). Verify src is rank-0 f32 memref.
-   - `asm_emitter.py`: Add `_emit_frsqrt`. Load src base address into a GPR (from reg_map), allocate pool register for result, emit `.insn r 0x2B, 0x0, 0x03, fd, rs1, x0`. Bind result to pool register.
+   - `npu_dialect.py`: Add FRsqrtOp with operands: src (Float32Type), result (Float32Type). Verify src is f32.
+   - `asm_emitter.py`: Add `_emit_frsqrt`. Look up src in FP pool, allocate pool register for result, emit `.insn r 0x2B, 0x0, 0x03, fd, fs, f0`. Bind result to pool register.
 3. **VERIFY**: Unit tests pass.
 
 #### Step 2.4: Scalar arith emission (fdiv.s, fadd.s)
@@ -649,7 +648,7 @@ The max-subtraction step prevents overflow in exp(). If the max is not correctly
 
 **Files**: `src/arrax/lowering/linalg_to_npu.py`, `tests/lowering/test_linalg_to_npu.py`
 
-1. **RED**: Write test that constructs a broadcast-mul generic with `arrax.rmsnorm_divisor` and `arrax.rmsnorm_eps` attributes (post-bufferize), runs LinalgToNpuPass, and verifies the output contains: `memref.load` (or forwarded SSA), `arith.divf`, `arith.addf`, `memref.alloca`, `memref.store`, `npu.frsqrt`, `npu.fvmul`.
+1. **RED**: Write test that constructs a broadcast-mul generic with `arrax.rmsnorm_divisor` and `arrax.rmsnorm_eps` attributes (post-bufferize), runs LinalgToNpuPass, and verifies the output contains: `memref.load` (or forwarded SSA), `arith.divf`, `arith.addf`, `npu.frsqrt`, `npu.fvmul`.
 2. **GREEN**: Extend `LinalgBroadcastBinaryToNpuPattern` (from Phase 3):
    - After loading the scalar from the rank-0 memref (or forwarding), check for `arrax.rmsnorm_divisor` attribute.
    - If present: extract N and eps from attributes. Emit:
@@ -657,9 +656,7 @@ The max-subtraction step prevents overflow in exp(). If the max is not correctly
      - `arith.DivfOp(%scalar, %N)` → `%meansq`
      - `arith.ConstantOp(FloatAttr(eps, f32))` → `%eps`
      - `arith.AddfOp(%meansq, %eps)` → `%shifted`
-     - `memref.AllocaOp(f32, shape=[])` → `%scratch`
-     - `memref.StoreOp(%shifted, %scratch, [])` (FRSQRT reads from memory)
-     - `FRsqrtOp(%scratch)` → `%scale`
+     - `FRsqrtOp(%shifted)` → `%scale` (register-to-register)
      - `FVMulOp(%src, %dst, %n, %scale)` (runtime scalar)
    - If not present: emit the plain broadcast pattern (from Phase 3).
 3. **VERIFY**: Tests pass.

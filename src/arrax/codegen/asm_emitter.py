@@ -873,16 +873,16 @@ class _AsmEmitter:
         )
 
     def _emit_frsqrt(self, op: FRsqrtOp) -> None:
-        """Emit FRSQRT: f[rd] = 1/sqrt(mem[rs1]).
+        """Emit FRSQRT: f[rd] = 1/sqrt(f[rs1]).
 
-        Reads one f32 from the rank-0 memref src, returns 1/sqrt to a float
-        register managed by the pool.
+        Takes an f32 value from an FP register, returns 1/sqrt to another
+        FP register managed by the pool.
         """
-        src_reg = self._reg(op.src)
+        src_reg = self._fp_pool.get(op.src)
         result_reg = self._fp_pool.allocate(op.result)
-        self._lines.append(f"    # NPU.FRSQRT {result_reg} = 1/sqrt(mem[{src_reg}])")
+        self._lines.append(f"    # NPU.FRSQRT {result_reg} = 1/sqrt({src_reg})")
         self._lines.append(
-            f"    .insn r 0x2B, 0x0, 0x03, {result_reg}, {src_reg}, x0"
+            f"    .insn r 0x2B, 0x0, 0x03, {result_reg}, {src_reg}, f0"
         )
 
     def _emit_fv_binop(
