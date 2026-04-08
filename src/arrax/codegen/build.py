@@ -22,6 +22,12 @@ COMMON_DIR = RISCV_NPU_DIR / "firmware" / "common"
 
 _KNOWN_GCC_NAMES = ("riscv64-unknown-elf-gcc", "riscv64-elf-gcc")
 
+# Path to the patched llc binary (built from llvm-npu/).
+_LLC_PATH = os.environ.get(
+    "ARRAX_LLC",
+    str(Path(__file__).parents[3] / "llvm-project" / "build" / "bin" / "llc"),
+)
+
 
 def _find_cross_gcc() -> str:
     """Auto-detect RISC-V cross-compiler.
@@ -125,6 +131,163 @@ def _run_cross_gcc(args: list[str]) -> subprocess.CompletedProcess[str]:
     The executable is resolved from a fixed allowlist via _find_cross_gcc().
     """
     return subprocess.run(args, capture_output=True, text=True)
+
+
+def build_elf_from_ll(
+    ll_text: str,
+    param_names: list[str],
+    shapes: dict[str, tuple[int, ...]],
+    output_dir: Path | None = None,
+    llc_path: str = _LLC_PATH,
+) -> Path:
+    """Build a complete ELF firmware from LLVM IR text.
+
+    Runs llc to produce an object file, generates a firmware wrapper
+    (main + data declarations + memcpy stub), assembles and links.
+
+    Requires: llc built with Xnpu patches, riscv-gcc.
+    """
+    if output_dir is None:
+        output_dir = Path(tempfile.mkdtemp(prefix="arrax_llvm_"))
+
+    ll_path = output_dir / "kernel.ll"
+    kernel_o = output_dir / "kernel.o"
+    wrapper_s = output_dir / "wrapper.S"
+    wrapper_o = output_dir / "wrapper.o"
+    elf_path = output_dir / "firmware.elf"
+
+    # 1. llc: .ll → kernel.o
+    ll_path.write_text(ll_text)
+    result = subprocess.run(
+        [
+            llc_path,
+            "-march=riscv32",
+            "-mattr=+f,+xnpu",
+            "-filetype=obj",
+            "-O2",
+            str(ll_path),
+            "-o",
+            str(kernel_o),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"llc failed:\n{result.stderr}")
+
+    # 2. Generate firmware wrapper (main + data + memcpy stub)
+    wrapper_asm = _generate_firmware_wrapper(param_names, shapes)
+    wrapper_s.write_text(wrapper_asm)
+
+    # 3. Assemble wrapper
+    gcc = _find_cross_gcc()
+    result = _run_cross_gcc([
+        gcc,
+        "-march=rv32imf",
+        "-mabi=ilp32f",
+        "-nostdlib",
+        "-ffreestanding",
+        "-c",
+        str(wrapper_s),
+        "-o",
+        str(wrapper_o),
+    ])
+    if result.returncode != 0:
+        raise RuntimeError(f"gcc assemble failed:\n{result.stderr}")
+
+    # 4. Link: kernel.o + wrapper.o + start.o
+    start_o = COMMON_DIR / "start.o"
+    linker_ld = COMMON_DIR / "linker.ld"
+    if not start_o.exists():
+        raise FileNotFoundError(f"riscv-npu start.o not found at {start_o}")
+    if not linker_ld.exists():
+        raise FileNotFoundError(f"riscv-npu linker.ld not found at {linker_ld}")
+    result = _run_cross_gcc([
+        gcc,
+        "-march=rv32imf",
+        "-mabi=ilp32f",
+        "-nostdlib",
+        "-ffreestanding",
+        f"-T{linker_ld}",
+        "-o",
+        str(elf_path),
+        str(kernel_o),
+        str(wrapper_o),
+        str(start_o),
+    ])
+    if result.returncode != 0:
+        raise RuntimeError(f"gcc link failed:\n{result.stderr}")
+
+    return elf_path
+
+
+def _generate_firmware_wrapper(
+    param_names: list[str],
+    shapes: dict[str, tuple[int, ...]],
+) -> str:
+    """Generate firmware wrapper assembly: main() + data + memcpy stub."""
+    lines: list[str] = []
+
+    all_names = list(param_names) + ["out"]
+    if len(all_names) > 8:
+        raise ValueError(
+            f"too many kernel arguments ({len(all_names)}); "
+            f"RISC-V only has a0-a7 (8 argument registers)"
+        )
+
+    # main function
+    lines.append("    .text")
+    lines.append("    .globl main")
+    lines.append("    .type main, @function")
+    lines.append("main:")
+    lines.append("    addi sp, sp, -4")
+    lines.append("    sw ra, 0(sp)")
+    for i, name in enumerate(all_names):
+        lines.append(f"    la a{i}, {name}")
+    lines.append("    call kernel")
+    lines.append("    lw ra, 0(sp)")
+    lines.append("    addi sp, sp, 4")
+    lines.append("    li a0, 0")
+    lines.append("    ret")
+    lines.append("")
+
+    # Minimal memcpy (required by LLVM's lowering of llvm.memcpy)
+    lines.append("    .globl memcpy")
+    lines.append("    .type memcpy, @function")
+    lines.append("memcpy:")
+    lines.append("    mv t3, a0")
+    lines.append("    beqz a2, .Lmemcpy_done")
+    lines.append(".Lmemcpy_loop:")
+    lines.append("    lb t0, 0(a1)")
+    lines.append("    sb t0, 0(t3)")
+    lines.append("    addi t3, t3, 1")
+    lines.append("    addi a1, a1, 1")
+    lines.append("    addi a2, a2, -1")
+    lines.append("    bnez a2, .Lmemcpy_loop")
+    lines.append(".Lmemcpy_done:")
+    lines.append("    ret")
+    lines.append("")
+
+    # Data declarations
+    lines.append("    .section .bss")
+    for name in param_names:
+        size = 1
+        for dim in shapes[name]:
+            size *= dim
+        size *= 4
+        lines.append(f"    .globl {name}")
+        lines.append(f"    .comm {name}, {size}, 4")
+
+    first_shape = shapes[param_names[0]]
+    out_size = 1
+    for dim in first_shape:
+        out_size *= dim
+    out_size *= 4
+    lines.append("    .globl out")
+    lines.append(f"    .comm out, {out_size}, 4")
+    lines.append("")
+
+    return "\n".join(lines) + "\n"
 
 
 def _assemble_and_link(full_asm: str, output_dir: Path | None = None) -> Path:
