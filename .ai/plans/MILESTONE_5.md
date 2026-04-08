@@ -2,7 +2,7 @@
 
 ## Goal
 
-Add an LLVM-based codegen path alongside the existing assembly emitter. This involves two bodies of work: (1) an LLVM RISC-V vendor extension (`Xnpu`) that teaches LLVM about the NPU's 16 FP instructions, and (2) xDSL lowering passes that convert the existing npu dialect IR into xDSL's LLVM dialect, which the existing llvmlite backend emits as `.ll` text.
+Add an LLVM-based codegen path alongside the existing assembly emitter. This involves two bodies of work: (1) an LLVM RISC-V vendor extension (`Xnpu`) that teaches LLVM about the NPU's 16 FP instructions, and (2) a direct LLVM IR emitter via llvmlite that walks the existing npu dialect IR and produces `.ll` text.
 
 The assembly emitter remains the default. The LLVM path is opt-in via `backend="llvm"` and produces LLVM IR text that can be compiled by a patched `llc`.
 
@@ -20,15 +20,10 @@ The assembly emitter remains the default. The LLVM path is opt-in via `backend="
                      new LLVM path (backend="llvm")
                     ┌─────────────────────────────────┐
                     │ npu dialect IR                  │
-                    │   → NpuToLlvm pass              │
-                    │   → ArithToLlvm pass            │
-                    │   → ScfToLlvm pass              │
-                    │   → MemrefToLlvm pass           │
-                    │   → FuncToLlvm pass             │
-                    │   → xDSL LLVM dialect IR        │
-                    │   → convert_module() [llvmlite] │
+                    │   → llvm_emitter.py (llvmlite)  │
                     │   → .ll text                    │
-                    │   → llc (patched) → .o          │
+                    │   → llc (patched) -filetype=obj │
+                    │   → kernel.o                    │
                     │   → riscv-gcc link → ELF        │
                     └─────────────────────────────────┘
 ```
@@ -43,19 +38,19 @@ Both paths share all passes up through NpuCanonicalize + verify. They diverge on
 - TableGen instruction definitions (R-type encoding, opcode 0x2B)
 - LLVM intrinsic declarations (`@llvm.riscv.npu.*`)
 - Instruction selection patterns (intrinsic → instruction, 1:1)
-- xDSL lowering passes: NpuToLlvm, ArithToLlvm, ScfToLlvm, MemrefToLlvm, FuncToLlvm
+- Direct LLVM IR emitter via llvmlite (walks npu dialect IR, emits `.ll` text)
 - Pipeline integration with `backend="llvm"` flag
-- Unit tests for each lowering pass
-- LLVM IR golden tests
-- Output parity tests (gated on `llc` availability)
+- Build tooling: `build-llvm.sh` script with idempotent patching
+- LLVM IR golden tests (21 tests covering all ops, tiling, composites, structure)
+- Output parity tests (7 tests, gated on `llc` availability)
 
 ### Out of scope
 
 - Integer NPU instructions (14 ops) — FP only
-- Automated LLVM build system — manual build with README
 - Replacing the assembly emitter — both paths coexist
 - LLVM optimization passes — rely on `llc -O2` defaults
 - Custom LLVM register classes for `facc` — modeled as implicit state
+- xDSL LLVM dialect lowering passes — xDSL lacks arith/memref/scf/func→LLVM conversions
 
 ## LLVM vendor extension: `Xnpu`
 
@@ -84,7 +79,7 @@ All FP NPU instructions use R-type encoding with opcode `0x2B`. Vector ops use f
 
 ### LLVM intrinsic signatures
 
-Each intrinsic maps 1:1 to a hardware instruction. The NpuToLlvm pass (Phase 2) handles all higher-level translation (copy loops for in-place ops, facc load sequences for scalar-vector ops, scratch buffer management for reductions).
+Each intrinsic maps 1:1 to a hardware instruction. The LLVM IR emitter handles all higher-level translation (memcpy for in-place ops, facc load sequences for scalar-vector ops, FRSTACC brackets for dot products).
 
 All vector ops share the signature `(ptr, ptr, i32) -> void`, mapping to `(rs1, rs2, rd)` in the instruction encoding:
 ```
@@ -127,17 +122,20 @@ All instruction selection patterns are trivial 1:1 `Pat<>` records — no custom
 
 ```
 llvm-npu/
-  README.md                  — LLVM clone + build instructions
+  README.md                  — quick start + manual setup instructions
+  build-llvm.sh              — automated: clone → copy → patch → build → test
   RISCVInstrInfoXnpu.td      — new file → lib/Target/RISCV/
   IntrinsicsRISCVXnpu.td     — new file → include/llvm/IR/
   tests/
-    test_vector_ops.ll        — FileCheck tests for vector instructions
-    test_reductions.ll        — FileCheck tests for reductions
-    test_scalar_ops.ll        — FileCheck tests for scalar FP ops
-    run_tests.sh              — standalone test runner (grep-based)
+    test_vector_ops.ll        — 9 vector instruction tests
+    test_reductions.ll        — FVREDUCE + FVMAX tests
+    test_scalar_ops.ll        — FMACC, FRSQRT, FRSTACC, FRELU, FGELU tests
+    run_tests.sh              — standalone test runner (grep-based, 16 checks)
 ```
 
-Files to modify in the LLVM tree (one-line additions each):
+`build-llvm.sh` handles the full build pipeline with idempotent patching (grep guards + post-patch verification). Uses `ninja -j2` to avoid OOM on constrained systems. The `JOBS` env var overrides parallelism.
+
+Files modified in the LLVM tree (one-line additions each, applied by `build-llvm.sh`):
 
 | File                                           | Change                                    |
 |------------------------------------------------|-------------------------------------------|
@@ -146,51 +144,53 @@ Files to modify in the LLVM tree (one-line additions each):
 | `include/llvm/IR/IntrinsicsRISCV.td`           | `include "IntrinsicsRISCVXnpu.td"`        |
 | `lib/Target/RISCV/RISCVSubtarget.h`           | `HasVendorXnpu` member + accessor         |
 
-## xDSL lowering passes
+## LLVM IR emitter (`src/arrax/codegen/llvm_emitter.py`)
 
-### NpuToLlvm (`src/arrax/lowering/npu_to_llvm.py`)
+### Design decision: direct emitter vs xDSL lowering passes
 
-Pattern-based `ModulePass`. Each npu op becomes an `llvm.call_intrinsic`:
+The original design called for 5 xDSL lowering passes (NpuToLlvm, ArithToLlvm, ScfToLlvm, MemrefToLlvm, FuncToLlvm) that would convert npu dialect IR into xDSL's LLVM dialect, then use `convert_module()` to emit `.ll` text.
 
-| npu op          | LLVM intrinsic                      |
-|-----------------|-------------------------------------|
-| `npu.fvadd`     | `@llvm.riscv.npu.fvadd`            |
-| `npu.fvsub`     | `@llvm.riscv.npu.fvsub`            |
-| `npu.fvrelu`    | `@llvm.riscv.npu.fvrelu`           |
-| `npu.fvexp`     | `@llvm.riscv.npu.fvexp`            |
-| `npu.fvmul`     | `@llvm.riscv.npu.fvmul`            |
-| `npu.fvdiv`     | `@llvm.riscv.npu.fvdiv`            |
-| `npu.fvsub_scalar` | `@llvm.riscv.npu.fvsub_scalar`  |
-| `npu.frsqrt`    | `@llvm.riscv.npu.frsqrt`           |
-| `npu.fvreduce`  | `@llvm.riscv.npu.fvreduce`         |
-| `npu.fvmax`     | `@llvm.riscv.npu.fvmax`            |
-| `npu.fvmac`     | `@llvm.riscv.npu.fvmac`            |
+This was abandoned because xDSL 0.59.0 lacks the necessary conversion passes (`arith-to-llvm`, `memref-to-llvm`, `scf-to-llvm`, `func-to-llvm`) and its LLVM dialect has no unconditional branch operation. Writing all 5 passes from scratch would have been substantial work with no reuse benefit.
 
-Memref operands are converted to `ptr` (LLVM opaque pointer). Index operands become `i32`. Float operands pass through.
+Instead, a direct llvmlite emitter walks the post-NpuCanonicalize IR (the same input as `asm_emitter.py`) and builds LLVM IR using the llvmlite library. This mirrors the asm emitter's traversal pattern but outputs LLVM IR instead of assembly text, keeping the two backends structurally parallel.
 
-### Standard dialect passes (`src/arrax/lowering/lower_to_llvm.py`)
-
-Bundled in one file since each covers a small op subset:
-
-**ArithToLlvm** — `arith.constant` → `llvm.mlir.constant`, `arith.subi` → `llvm.sub`, `arith.minsi` → `llvm.icmp slt` + `llvm.select`, `arith.addf` → `llvm.fadd`, `arith.divf` → `llvm.fdiv`
-
-**ScfToLlvm** — `scf.for` + `scf.yield` → LLVM basic blocks with `llvm.br`, `llvm.cond_br`, `phi` nodes for IVs and iter_args. This is the most complex pass.
-
-**MemrefToLlvm** — `memref.alloc`/`memref.alloca` → `llvm.alloca`, `memref.subview` → `llvm.getelementptr`, `memref.store` → `llvm.store`, `memref.load` → `llvm.load`. All memrefs lower to `ptr` (flat memory model, no descriptor).
-
-**FuncToLlvm** — `func.func` → `llvm.func`, `func.return` → `llvm.return`. Arguments: memref → `ptr`, index → `i32`, f32 → `f32`.
-
-### LLVM IR emitter (`src/arrax/codegen/llvm_emitter.py`)
+### Architecture
 
 ```python
 def emit_llvm_ir(module: ModuleOp) -> str:
-    """Lower npu dialect IR to LLVM dialect, emit .ll text."""
-    ctx = Context()
-    NpuToLlvmPass().apply(ctx, module)
-    LowerToLlvmPass().apply(ctx, module)
-    llvm_module = convert_module(module)  # xdsl.backend.llvm.convert
-    return str(llvm_module)
+    """Walk npu dialect IR, build LLVM IR via llvmlite, return .ll text."""
+    emitter = _LlvmEmitter()
+    emitter.emit_module(module)
+    return str(emitter.get_module())
 ```
+
+`_LlvmEmitter` is a stateful class that maintains:
+- An SSA value map (`id(SSAValue) → ir.Value`) for translating xDSL values to llvmlite values
+- An intrinsic cache for deduplicating `@llvm.riscv.npu.*` declarations
+- An `ir.IRBuilder` that advances through basic blocks
+
+### Op coverage
+
+| xDSL dialect | Ops handled                                                               |
+|--------------|---------------------------------------------------------------------------|
+| npu          | FVAdd, FVSub, FVRelu, FVExp, FVMul, FVDiv, FVSubScalar, FRsqrt,         |
+|              | FVReduce, FVMax, FVMac                                                    |
+| arith        | ConstantOp (i32, f32), SubiOp, MinSIOp, AddfOp, DivfOp                   |
+| memref       | AllocOp, AllocaOp, SubviewOp, StoreOp, LoadOp                            |
+| scf          | ForOp (with iter_args + phi nodes), YieldOp                               |
+| func         | FuncOp, ReturnOp                                                          |
+
+### Key emission patterns
+
+**Binary vector ops (fvadd, fvsub):** Hardware writes in-place to rs2. If `src2 != dst`, emit `llvm.memcpy` first to copy src2 → dst, then call the intrinsic with `(src1, dst, n)`.
+
+**Scalar-vector ops (fvmul, fvdiv, fvsub.scalar):** Load scalar into facc via `frstacc` (zero) + `fmacc(scalar, 1.0)`, then call the vector intrinsic.
+
+**Dot product (fvmac):** Untiled: emit full FRSTACC bracket inline (zero → fvmac → read). Tiled: `_emit_for` wraps the loop with FRSTACC bracket (zero before header, read after exit).
+
+**scf.for:** Lowered to `preheader → header → body → header / exit` basic blocks with phi nodes for IV and iter_args. IV advancement and yield-to-phi threading handled in the yield handler.
+
+**Reductions (fvreduce, fvmax):** Return `float` partial result from intrinsic, then combine with accumulator phi via `fadd` (sum) or `maxnum` + NaN check (max).
 
 ## Pipeline integration
 
@@ -211,149 +211,122 @@ def compile_to_asm(
 
 ```
 src/arrax/
-  lowering/
-    npu_to_llvm.py          — NpuToLlvm pass
-    lower_to_llvm.py        — ArithToLlvm, ScfToLlvm, MemrefToLlvm, FuncToLlvm
   codegen/
-    llvm_emitter.py          — emit_llvm_ir() entry point
+    llvm_emitter.py          — emit_llvm_ir() entry point (direct llvmlite emitter)
+    build.py                 — build_elf_from_ll(), _generate_firmware_wrapper()
     asm_emitter.py           — unchanged
 
 llvm-npu/
-  README.md                  — LLVM build instructions
-  patches/
-    0001-add-xnpu-extension.patch
+  README.md                  — quick start + manual setup instructions
+  build-llvm.sh              — automated clone → patch → build → test
+  RISCVInstrInfoXnpu.td      — instruction definitions + isel patterns
+  IntrinsicsRISCVXnpu.td     — intrinsic declarations
   tests/
-    test_fvadd.ll            — hand-written .ll for standalone llc testing
-    test_fvreduce.ll
-    ...
-    run_tests.sh             — shell script: llc each .ll, check .insn encoding
+    test_vector_ops.ll        — 9 vector instruction tests
+    test_reductions.ll        — reduction instruction tests
+    test_scalar_ops.ll        — scalar FP instruction tests
+    run_tests.sh              — standalone test runner (16 mnemonic checks)
+
+tests/codegen/
+  test_llvm_emitter.py       — 21 golden tests (ops, tiling, composites, structure)
+  test_llvm_parity.py        — 7 E2E parity tests (gated on llc availability)
 ```
 
 ## Testing strategy
 
 ### Phase 1: LLVM patch tests (standalone, shell)
 
-Hand-written `.ll` files in `llvm-npu/tests/` that call `@llvm.riscv.npu.*` intrinsics. Validated with:
+Hand-written `.ll` files in `llvm-npu/tests/` that call `@llvm.riscv.npu.*` intrinsics. Validated with `run_tests.sh` which compiles each file via `llc` and greps for expected `.insn` mnemonics. 16 checks total covering all FP instructions. These live outside the Python test suite — they validate the LLVM patches with no Python dependency.
 
-```bash
-llc -march=riscv32 -mattr=+f,+xnpu test_fvadd.ll -o - | grep ".insn r 0x2B"
-```
+### Phase 2: LLVM IR golden tests (Python, no LLVM needed)
 
-These live outside the Python test suite — they validate the LLVM patches with no Python dependency.
+21 tests in `tests/codegen/test_llvm_emitter.py`:
+- **Basic (9):** untiled vector ops (add, sub, relu, exp, scalar-mul, scalar-div, sum, amax, dot)
+- **Tiled (3):** add, dot, sum with N=128 — verify loop structure (phi nodes, for.header blocks)
+- **Composite (3):** softmax, rmsnorm, fused expression — verify multi-op sequences
+- **Defensive (1):** alloca + load for ops not in current pipeline
+- **Structural (5):** target triple, function signature, memcpy for in-place ops, no register names
 
-### Phase 2: Lowering pass unit tests (Python, no LLVM needed)
+All tests check `.ll` text via substring matching — no `llc` dependency.
 
-- `tests/lowering/test_npu_to_llvm.py` — each NPU op → expected `llvm.call_intrinsic`
-- `tests/lowering/test_lower_to_llvm.py` — arith/scf/memref/func ops → expected LLVM dialect IR
+### Phase 3: Output parity tests (Python, requires patched `llc`)
 
-Construct small xDSL modules, run passes, assert on output ops. No `llc` dependency.
+7 tests in `tests/codegen/test_llvm_parity.py`:
+- `add_small` (N=4), `add_tiled` (N=128), `sum`, `dot`, `softmax`, `rmsnorm`, `fused_expression`
+- Same expression → both backends → riscv-npu emulator → `assert_allclose(rtol=1e-5)`
+- Gated on `_has_llc` via `pytest.mark.skipif`
 
-### Phase 3: LLVM IR golden tests (Python, no LLVM needed)
-
-Known Python expressions → `compile_to_asm(..., backend="llvm")` → assert `.ll` text contains expected intrinsic calls, basic block structure, phi nodes. String matching on the output.
-
-### Phase 4: Output parity tests (Python, requires patched `llc`)
-
-Same expression through both backends → emulator → compare numerical results within f32 tolerance. Gated with `pytest.mark.skipif(not shutil.which("llc"))`.
-
-Expressions to test: `A + B`, `softmax(A)`, `rmsnorm(A)`, `dot(A, B)`, `A * 0.5 + B`.
-
-### Success criteria
+### Success criteria (all met)
 
 1. All 16 FP instructions defined in TableGen; `llc` compiles hand-written `.ll` to correct `.insn` encoding
-2. Full lowering from post-NpuCanonicalize IR to xDSL LLVM dialect for every op the pipeline produces
-3. `convert_module()` successfully emits `.ll` text for all existing test expressions
-4. When patched `llc` is available: output parity with asm_emitter for representative expressions
-5. Existing 492 tests remain green — the LLVM path is additive
+2. Direct llvmlite emitter covers every op the pipeline produces (npu, arith, memref, scf, func)
+3. `emit_llvm_ir()` successfully produces `.ll` text for all test expressions
+4. When patched `llc` is available: output parity with asm_emitter for all 7 representative expressions
+5. All 518 tests pass — the LLVM path is additive
 
-## Implementation plan
+## Implementation plan (completed)
 
 ### Phase 1: LLVM vendor extension patches
 
-**1.1 Scaffold `llvm-npu/` directory**
-- Create `llvm-npu/README.md` with LLVM clone + build instructions
-- Create `llvm-npu/patches/` directory
-- Create `llvm-npu/tests/` directory with `run_tests.sh` stub
+**1.1 Scaffold `llvm-npu/` directory** ✓
+- `llvm-npu/README.md` with quick start + manual setup instructions
+- `llvm-npu/tests/` directory with `.ll` test files and `run_tests.sh`
 
-**1.2 Write `RISCVFeatures.td` patch**
-- Add `HasVendorXnpu` feature predicate
-- Add `Xnpu` extension to the vendor extension list
-- Gate on `-march=rv32imf_xnpu0p1`
+**1.2 Write `IntrinsicsRISCVXnpu.td`** ✓
+- 16 LLVM intrinsic declarations grouped by memory effect:
+  - `IntrArgMemOnly`: pure vector ops (fvadd, fvsub, fvexp, fvrelu, fvgelu, fvdiv, fvsub_scalar)
+  - `IntrInaccessibleMemOrArgMemOnly`: facc-touching vector ops (fvmul, fvmac)
+  - `IntrInaccessibleMemOnly`: facc-only ops (fmacc, frstacc)
+  - `IntrNoMem`: pure scalar ops (frsqrt, frelu, fgelu)
+- Reductions (fvreduce, fvmax): `IntrArgMemOnly` with FPR result
 
-**1.3 Write `RISCVInstrInfoXnpu.td`**
-- Define R-type instruction format for opcode 0x2B
-- Define all 16 FP instructions with correct funct3/funct7 encoding
-- Vector ops: 3 GPR operands (rs1=addr, rs2=addr/dst, rd=n)
-- Scalar ops: FPR operands as appropriate
-- Include from `RISCVInstrInfo.td`
+**1.3 Write `RISCVInstrInfoXnpu.td`** ✓
+- 4 encoding classes: `XNpuVecGPR` (9 vector ops), `XNpuReduce` (2 reductions), `XNpuScalarFF` (3 scalar unary), inline FMACC/FRSTACC
+- Uses `Inst{6-0} = OPC_CUSTOM_1.Value` (not `let Opcode =` which doesn't exist in `RVInst`)
+- FMACC/FRSTACC set `mayLoad=1, mayStore=1` to match intrinsic memory effects
+- All isel patterns are trivial `Pat<>` records — no custom `ISelLowering` needed
+- Gated on `let Predicates = [HasVendorXnpu]`
 
-**1.4 Write `IntrinsicsRISCV.td` patch**
-- Declare all 16 `@llvm.riscv.npu.*` intrinsics
-- Vector intrinsics: `(ptr, ptr, ptr, i32) -> void` with memory effects
-- Scalar intrinsics: appropriate FP signatures
-- Mark memory read/write side effects correctly
+**1.4 Write hand-written `.ll` test files** ✓
+- `test_vector_ops.ll`: 9 vector instructions
+- `test_reductions.ll`: FVREDUCE + FVMAX with accumulation patterns
+- `test_scalar_ops.ll`: FMACC, FRSQRT, FRSTACC, FRELU, FGELU
+- `run_tests.sh`: 16 mnemonic checks (compile + grep)
 
-**1.5 Write instruction selection patterns**
-- `Pat<>` records in `RISCVInstrInfoXnpu.td` mapping each intrinsic to its instruction
-- Add `RISCVISelLowering.cpp` changes if custom lowering is needed for intrinsic → node → instruction
+**1.5 Write `build-llvm.sh`** ✓
+- Automated: clone LLVM → copy TableGen files → patch (idempotent grep guards + post-patch verification) → cmake → `ninja -j2` → run tests
+- GNU sed check, `JOBS` env var for parallelism override
 
-**1.6 Write hand-written `.ll` test files**
-- One `.ll` file per instruction (or grouped by category)
-- `run_tests.sh`: compile each with `llc`, grep for expected `.insn` encoding
+### Phase 2: Direct LLVM IR emitter
 
-**1.7 Generate patch file**
-- Build LLVM with patches applied, verify tests pass
-- `git diff` → `0001-add-xnpu-extension.patch`
+> Original design called for 5 xDSL lowering passes. Pivoted to direct llvmlite emitter because xDSL 0.59.0 lacks arith/memref/scf/func→LLVM conversions and has no unconditional branch in its LLVM dialect.
 
-### Phase 2: xDSL lowering passes
+**2.1 `llvm_emitter.py`** ✓
+- `_LlvmEmitter` class: walks xDSL IR, builds llvmlite IR
+- Handles all 11 NPU ops, 5 arith ops, 5 memref ops, scf.for/yield, func.func/return
+- Key patterns: `_emit_facc_load` (FRSTACC + FMACC bracket), `_emit_memcpy` (llvm.memcpy intrinsic), `_emit_for` with FRSTACC bracket for FVMac loops, phi nodes for iter_args
+- Opaque pointers (`ir.PointerType()`), GEP with `source_etype=_f32`
+- Target: `riscv32-unknown-none-elf`
 
-**2.1 NpuToLlvm pass**
-- `src/arrax/lowering/npu_to_llvm.py`
-- Pattern per NPU op: convert memref → ptr, index → i32, emit `llvm.call_intrinsic`
-- `tests/lowering/test_npu_to_llvm.py` — unit test each pattern
-
-**2.2 FuncToLlvm patterns**
-- In `src/arrax/lowering/lower_to_llvm.py`
-- `func.func` → `llvm.func` (memref args → ptr, index → i32)
-- `func.return` → `llvm.return`
-- Unit tests
-
-**2.3 ArithToLlvm patterns**
-- In `lower_to_llvm.py`
-- ConstantOp, SubiOp, MinSIOp, AddfOp, DivfOp → LLVM equivalents
-- Unit tests
-
-**2.4 MemrefToLlvm patterns**
-- In `lower_to_llvm.py`
-- AllocOp/AllocaOp → `llvm.alloca`
-- SubviewOp → `llvm.getelementptr`
-- StoreOp/LoadOp → `llvm.store`/`llvm.load`
-- All memrefs lower to `ptr` (flat memory, no descriptor)
-- Unit tests
-
-**2.5 ScfToLlvm patterns**
-- In `lower_to_llvm.py`
-- `scf.for` + `scf.yield` → basic blocks, `llvm.br`, `llvm.cond_br`, phi nodes
-- Handle iter_args threading
-- Unit tests with both simple loops and reduction loops with iter_args
-
-### Phase 3: Pipeline integration and end-to-end tests
-
-**3.1 LLVM IR emitter**
-- `src/arrax/codegen/llvm_emitter.py`
-- `emit_llvm_ir(module)` → runs lowering passes, calls `convert_module()`, returns `.ll` text
-
-**3.2 Pipeline integration**
-- Add `backend` parameter to `compile_to_asm()` in `pipeline.py`
+**2.2 Pipeline integration** ✓
+- `backend` parameter added to `compile_to_asm()` in `pipeline.py`
 - `backend="llvm"` calls `emit_llvm_ir()` instead of `emit_assembly()`
-- Default remains `"asm"`
+- Both backends share all passes through NpuCanonicalize + verify
 
-**3.3 LLVM IR golden tests**
-- `tests/codegen/test_llvm_emitter.py`
-- Known expressions → `backend="llvm"` → assert `.ll` contains expected intrinsic calls
-- Test: `A + B`, `sum(A)`, `dot(A, B)`, `softmax(A)`, `rmsnorm(A)`
+**2.3 Build tooling** ✓
+- `build_elf_from_ll()` in `build.py`: `.ll` → `llc -filetype=obj -O2` → `kernel.o` → link
+- `_generate_firmware_wrapper()`: main() + data declarations + memcpy stub
+- Memcpy stub: byte-by-byte copy using t0/t3, preserving a0 return value
+- `llc -filetype=obj` bypasses GCC assembler (which doesn't know custom mnemonics)
 
-**3.4 Output parity tests (optional, requires patched `llc`)**
-- `tests/codegen/test_llvm_parity.py`
-- Gated on `llc` availability
-- Same expression → both backends → emulator → compare results
+### Phase 3: Tests
+
+**3.1 LLVM IR golden tests** ✓
+- 21 tests in `tests/codegen/test_llvm_emitter.py`
+- Coverage: basic (9), tiled (3), composite (3), defensive (1), structural (5)
+
+**3.2 Output parity tests** ✓
+- 7 tests in `tests/codegen/test_llvm_parity.py`
+- add_small, add_tiled, sum, dot, softmax, rmsnorm, fused_expression
+- Gated on `_has_llc` via `pytest.mark.skipif`
+- `assert_allclose(rtol=1e-5)` between both backends
