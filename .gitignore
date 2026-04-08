@@ -9,3 +9,4 @@ build/
 *.elf
 *.o
 *.dump
+llvm-project/
